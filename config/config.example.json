@@ -1,0 +1,56 @@
+{
+  "$comment": "复制为 config/config.json 后填写真实凭据。可通过环境变量覆盖密钥：OPENCODE_PASSWORD、BOT_<NAME>_APP_ID、BOT_<NAME>_APP_SECRET。opencode.dataDir 指向 ../data/opencode 时，桥会启动专属 OpenCode 服务、把会话库（历史/上下文）放进 data/ 下，使整个 data/ 可整包迁移；不需要隔离时删掉该项即回退到本机共享服务。bot.location 是会话工作目录根（建议放在 ../data 下），bot.project 指向提供 .opencode agents/skills 的 OpenCode 项目目录；二者不同时，桥接会自动在 location 下镜像该项目的 .opencode 与 opencode 配置。",
+  "logLevel": "info",
+  "storageDir": "../data",
+  "opencode": {
+    "mode": "service",
+    "baseUrl": "http://127.0.0.1:4096",
+    "password": "",
+    "location": "D:/myapp/feishu-bridge",
+    "dataDir": "../data/opencode",
+    "servicePort": 0,
+    "serviceCommand": ["opencode", "serve", "--service"],
+    "restartCommand": ["opencode", "service", "restart"],
+    "healthIntervalMs": 30000,
+    "healthTimeoutMs": 8000,
+    "restartOnFailure": true,
+    "failureThreshold": 3
+  },
+  "bots": [
+    {
+      "name": "assistant",
+      "appId": "cli_xxxxxxxxxxxxxxxx",
+      "appSecret": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "domain": "feishu",
+      "agent": "build",
+      "model": { "providerID": "myapi", "id": "deepseek-v4-free" },
+      "location": "../data/workspaces",
+      "project": "D:/path/to/your/opencode/project",
+      "perUserInGroup": false,
+      "requireMention": true,
+      "commands": true,
+      "holdAttachmentsWithoutText": true,
+      "streaming": {
+        "strategy": "cardkit",
+        "intervalMs": 700,
+        "showReasoning": false,
+        "showTools": true
+      },
+      "access": {
+        "allowChats": [],
+        "allowUsers": [],
+        "alertChatId": ""
+      }
+    }
+  ],
+  "cron": [
+    {
+      "name": "daily-standup",
+      "bot": "assistant",
+      "schedule": "0 9 * * 1-5",
+      "chatId": "oc_xxxxxxxxxxxxxxxx",
+      "prompt": "请总结昨天的工作并给出今天的计划。",
+      "enabled": false
+    }
+  ]
+}
