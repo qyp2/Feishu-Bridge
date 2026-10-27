@@ -27,6 +27,14 @@ export interface Binding {
    * ever delivering it twice.
    */
   lastDeliveredMessageID?: string
+  /** Absolute paths already uploaded for this chat, so a later sweep does not send them again. */
+  sentFilePaths?: string[]
+  /**
+   * Feishu card of the turn that is still streaming. Kept so a bridge restart
+   * can finish that same card instead of leaving a spinner behind.
+   */
+  progressMessageID?: string
+  progressCardID?: string
   createdAt: number
   updatedAt: number
 }

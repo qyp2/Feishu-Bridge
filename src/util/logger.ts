@@ -84,7 +84,7 @@ function replacer(_key: string, value: unknown): unknown {
  */
 export class AuditLog {
   private readonly file: string
-  constructor(private readonly dir: string) {
+  constructor(dir: string) {
     ensureDir(dir)
     this.file = path.join(dir, "audit.jsonl")
   }

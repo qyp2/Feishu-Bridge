@@ -1,8 +1,9 @@
 import type { FormField, FormInfo, PermissionRequest } from "../opencode/types.js"
+import type { CronJobInfo } from "../core/commands.js"
 
 /** A stable marker used to route card callbacks back to the bridge. */
 export interface CardValue {
-  k: "perm" | "form" | "menu" | "cancel"
+  k: "perm" | "form" | "menu" | "cancel" | "gap" | "cron-sub" | "cron-mail-sub" | "cron-cancel" | "cron-del" | "cron-del-yes" | "cron-pause" | "cron-edit" | "cron-mgr" | "cron-urgent" | "make-form" | "make-sub" | "make-refresh" | "make-addfile" | "make-cancel"
   s?: string
   r?: string
   d?: string
@@ -222,9 +223,13 @@ function formFieldElements(
 
 let formRenderSeq = 0
 
-function nextFormNonce(): number {
-  formRenderSeq = (formRenderSeq + 1) % Number.MAX_SAFE_INTEGER
-  return formRenderSeq
+/**
+ * 时间戳基数 + 毫秒内自增：纯内存计数在 tsx watch 重载后会归零，可能撞上
+ * 12h 去重窗口内旧卡片的 value（点击被 SDK 吞掉，表现为「回调失败」）。
+ */
+export function nextFormNonce(): number {
+  formRenderSeq = (formRenderSeq + 1) % 1000
+  return Date.now() * 1000 + formRenderSeq
 }
 
 function answerText(value: unknown): string {
@@ -238,24 +243,496 @@ function formatAnswer(value: unknown): string {
   return value == null ? "" : String(value)
 }
 
+export interface GapFillField {
+  key: string
+  heading: string
+}
+
+/**
+ * System card for missing deliverable sections. Every field is a text input.
+ * There are no preset choices: the user types the missing body and submits.
+ */
+export function gapFillCard(token: string, fields: GapFillField[], multiline: boolean, omitted = 0): object {
+  const nonce = nextFormNonce()
+  const elements: object[] = [
+    {
+      tag: "markdown",
+      content:
+        "以下内容在上传的材料里没有。请直接输入对应正文。留空的项保持「未提供」。提交后继续生成文件。" +
+        (omitted > 0 ? `\n\n还有 ${omitted} 项未列出，这些项保持「未提供」。` : ""),
+    },
+  ]
+  fields.forEach((field, index) => {
+    elements.push({
+      tag: "markdown",
+      content: `**${index + 1}. ${escapeMarkdown(field.heading)}**`,
+    })
+    const input: Record<string, unknown> = {
+      tag: "input",
+      name: field.key,
+      width: "fill",
+      max_length: 1000,
+      placeholder: { tag: "plain_text", content: "请输入这一节的正文" },
+    }
+    if (multiline) {
+      input.input_type = "multiline_text"
+      input.rows = 4
+    }
+    elements.push(input)
+  })
+  elements.push({ tag: "hr" })
+  elements.push(
+    buttonRow([
+      formSubmitButton("提交并继续", { n: nonce, k: "gap", f: token }, "primary", "submit"),
+    ]),
+  )
+  return baseCard("补充缺失内容", "orange", [
+    { tag: "form", name: `gap_${token}`.slice(0, 40), elements },
+  ])
+}
+
+export function gapDoneCard(markdown: string, template = "green"): object {
+  return statusCard("补充缺失内容", markdown, template)
+}
+
+export function gapRetryCard(reason: string, token: string): object {
+  return baseCard("补充缺失内容", "red", [
+    { tag: "markdown", content: `补充已保存，但文件还没有发出。\n\n${escapeMarkdown(reason)}` },
+    buttonRow([callbackButton("重试生成", { k: "gap", f: token }, "primary")]),
+  ])
+}
+
+/** Greeting reply: what this bot can do, shown when a message has no task words. */
+export function welcomeCard(sharedTemplates: string[], personalTemplates: string[] = []): object {
+  const parts: string[] = []
+  if (sharedTemplates.length) parts.push(`共享模板：${sharedTemplates.map((name) => `「${name}」`).join("、")}`)
+  if (personalTemplates.length) parts.push(`我的模板：${personalTemplates.map((name) => `「${name}」`).join("、")}`)
+  const templateLine = parts.length
+    ? `${parts.join("；")}。说「用${personalTemplates[0] ?? sharedTemplates[0]}模板」即可套用；也支持随消息上传新模板。`
+    : "支持随消息上传企业模板套用；发 .pptx 并写「存为模板 名字」可建立个人模板库。"
+  return baseCard("🤖 产品智能助手", "blue", [
+    {
+      tag: "markdown",
+      content:
+        "你好！我专注于产品团队的**文档成稿与产品分析**，目前重点支持这些任务：",
+    },
+    {
+      tag: "markdown",
+      content: [
+        "- 📊 **商业计划书 PPT 生成**：给材料即可自动成稿，套用企业模板直接汇报",
+        "- 📄 **产品标准化请示文档生成**：九大模块结构化请示，支持 PPT / Word / PDF",
+        "- 📉 **产品市场退出报告生成**：退出背景、影响与安排全套材料",
+        "- 📡 **商机资讯雷达**：推荐产品/领域相关展会、活动与资讯，支持追问分析与个人定时订阅",
+        "- 📈 **产品管理专题分析**：需求、竞品、市场、研发、测试、发布、运营、反馈等 20 类",
+        "- 📑 **办公文件一键导出**：Markdown 内容转 PPT / Word / Excel / PDF",
+      ].join("\n"),
+    },
+    { tag: "hr" },
+    {
+      tag: "markdown",
+      content: `**模板库**\n${templateLine}\n\n**小提示**：直接说出任务即可，例如「用移动内部汇报模板做一份 XX 产品商业计划书 PPT」；点击下方菜单「帮助」查看使用说明。`,
+    },
+  ])
+}
+
+function selectOption(label: string, value: string): object {
+  return { text: { tag: "plain_text", content: label }, value }
+}
+
+/** 多选下拉（form 容器内使用）;initial 为预选 value 数组。 */
+function multiSelectStatic(name: string, placeholder: string, options: object[], initial?: string[]): object {
+  const el: Record<string, unknown> = {
+    tag: "multi_select_static",
+    name,
+    width: "fill",
+    placeholder: { tag: "plain_text", content: placeholder },
+    options,
+  }
+  if (initial && initial.length > 0) el.initial_value = initial
+  return el
+}
+
+// ---- 制作中心 --------------------------------------------------------------
+
+export type MakeFormat = "pptx" | "docx" | "pdf" | "xlsx" | "copy"
+
+export interface MakeFormData {
+  format: MakeFormat
+  /** 已发到本会话的本地文件（缓存）:label 展示名,value 缓存文件名。 */
+  files: Array<{ label: string; value: string }>
+  sharedTemplates: string[]
+  personalTemplates: string[]
+}
+
+/** 刷新重渲染时的回填值:用户已填内容一字不丢。 */
+export interface MakeFormPreset {
+  instruction?: string
+  template?: string
+  cloud?: string
+  /** 预选的缓存文件名(value 数组):已勾选 + 新拖入的本地文件。 */
+  files?: string[]
+}
+
+const MAKE_COPY: Record<MakeFormat, { title: string; formatWord: string }> = {
+  pptx: { title: "PPT 生成", formatWord: "PPT" },
+  docx: { title: "Word 文档生成", formatWord: "Word 文档" },
+  pdf: { title: "PDF 文档生成", formatWord: "PDF" },
+  xlsx: { title: "Excel 生成", formatWord: "Excel" },
+  copy: { title: "文案制作", formatWord: "" },
+}
+
+/** 海报制作占位:诚实说明,不放假按钮。 */
+export function makePosterCard(): object {
+  return statusCard(
+    "🖼️ 海报制作",
+    "海报自动生成(排版 + 配图)正在建设中,暂未开放。\n现阶段可以先让我产出**海报文案与排版说明**(走「文案制作」),再交给设计工具或同事出图。",
+    "orange",
+  )
+}
+
+/**
+ * 制作表单:指令 + 本地文件多选 + 模板选择(仅 PPT)+ 云文件链接(可选)。
+ * 本地文件通过「拖到聊天窗发送 → 点刷新」进入勾选区;刷新按钮是表单提交,
+ * 已填内容随 form_value 带回并重渲染回填,不会丢失。
+ */
+export function makeFormCard(data: MakeFormData, preset?: MakeFormPreset, nonce = nextFormNonce()): object {
+  const copy = MAKE_COPY[data.format]
+  const elements: object[] = []
+
+  elements.push({
+    tag: "input",
+    name: "instruction",
+    width: "fill",
+    input_type: "multiline_text",
+    rows: 3,
+    max_length: 500,
+    default_value: preset?.instruction,
+    placeholder: {
+      tag: "plain_text",
+      content:
+        data.format === "pptx"
+          ? "具体指令,如:做一份 FTTR 家庭组网方案的商业计划书 PPT,10 页以内,面向内部评审"
+          : data.format === "xlsx"
+            ? "具体指令,如:把上传的销售记录整理成月度对账 Excel,含明细 sheet、汇总 sheet 和图表"
+            : data.format === "copy"
+              ? "具体指令,如:写一篇 5G 新通话的公众号推文,800 字,语气轻快"
+              : "具体指令,如:把上传的材料整理成一份产品请示文档,包含背景、方案、预算",
+      },
+  })
+
+  if (data.files.length > 0) {
+    elements.push({ tag: "markdown", content: "**资料文件**(可多选)" })
+    elements.push(
+      multiSelectStatic(
+        "files",
+        "选择文件",
+        data.files.map((file) => selectOption(file.label, file.value)),
+        preset?.files,
+      ),
+    )
+  } else {
+    elements.push({
+      tag: "markdown",
+      content: "<font color='grey'>资料文件:点下方「添加本地文件」,用 + 号发送后自动勾选。</font>",
+      text_size: "notation",
+    })
+  }
+
+  if (data.format === "pptx") {
+    const templateOptions = [
+      selectOption("不使用模板", ""),
+      ...data.personalTemplates.map((name) => selectOption(`【我的】${name}`, name)),
+      ...data.sharedTemplates.map((name) => selectOption(`【共享】${name}`, name)),
+    ]
+    elements.push({ tag: "markdown", content: "**模板**" })
+    elements.push(selectStatic("template", "选择模板", templateOptions, preset?.template ?? ""))
+  }
+
+  elements.push({
+    tag: "input",
+    name: "cloud",
+    width: "fill",
+    default_value: preset?.cloud,
+    placeholder: { tag: "plain_text", content: "云文件链接(可选),如 https://xxx.feishu.cn/file/abc123…" },
+  })
+
+  elements.push({ tag: "hr" })
+  elements.push(
+    buttonRow([
+      formSubmitButton("开始生成", { n: nonce, k: "make-sub", f: data.format }, "primary", "submit"),
+      formSubmitButton("添加本地文件", { n: nonce, k: "make-addfile", f: data.format }, "default", "addfile"),
+      formSubmitButton("刷新文件列表", { n: nonce, k: "make-refresh", f: data.format }, "default", "refresh"),
+      formSubmitButton("取消", { n: nonce, k: "make-cancel", f: data.format }, "default", "cancelmake"),
+    ]),
+  )
+  return baseCard(copy.title, "blue", [{ tag: "form", name: "make_form", elements }])
+}
+
+/** 提交成功后替换表单卡的确认卡。 */
+export function makeSubmittedCard(format: MakeFormat, instruction: string, fileCount: number, template: string): object {
+  const lines = [`指令:${instruction.slice(0, 80)}${instruction.length > 80 ? "…" : ""}`]
+  if (fileCount > 0) lines.push(`资料:${fileCount} 个文件`)
+  if (template) lines.push(`模板:${template}`)
+  return statusCard(
+    `✅ ${MAKE_COPY[format].title}已提交`,
+    `${lines.join("\n")}\n\n生成完成后文件会直接发到本会话。`,
+    "green",
+  )
+}
+
+function selectStatic(name: string, placeholder: string, options: object[], initial?: string): object {
+  const el: Record<string, unknown> = {
+    tag: "select_static",
+    name,
+    width: "fill",
+    placeholder: { tag: "plain_text", content: placeholder },
+    options,
+  }
+  // Pre-select in edit mode. Unknown fields are ignored by Feishu, so this is
+  // safe even on surfaces whose card runtime does not honour initial_option.
+  if (initial !== undefined) el.initial_option = initial
+  return el
+}
+
+const DOW_CN: Record<string, string> = { mon: "一", tue: "二", wed: "三", thu: "四", fri: "五", sat: "六", sun: "日" }
+
+/** `45 10 * * thu` → `每周四 10:45`（只处理订阅入口自身生成的五段式）。 */
+function humanSchedule(schedule: string): string {
+  const [m, h, dom, , dow] = schedule.trim().split(/\s+/)
+  const time = `${h}:${String(m).padStart(2, "0")}`
+  if (dow === "mon-fri") return `每工作日 ${time}`
+  if (dow && dow !== "*") return `每周${DOW_CN[dow] ?? dow} ${time}`
+  if (dom && dom !== "*") return `每月 ${dom} 号 ${time}`
+  return `每天 ${time}`
+}
+
+/** Reverse of humanSchedule's inputs: cron 五段式 → 表单默认值。 */
+function scheduleToForm(schedule: string): { freq?: string; hour?: string; minute?: string } {
+  const [m, h, dom, , dow] = schedule.trim().split(/\s+/)
+  let freq: string | undefined
+  if (dow === "mon-fri") freq = "workday"
+  else if (dow && dow !== "*") freq = dow
+  else if (dom && dom !== "*") freq = dom === "1" || dom === "15" ? `dom${dom}` : undefined
+  else freq = "daily"
+  return { freq, hour: h, minute: String(Number(m)) }
+}
+
+/** 时间下拉（订阅表单与邮件订阅表单共用）：小时 0-23，分钟 5 分钟一档。 */
+function hourOptions(): object[] {
+  return Array.from({ length: 24 }, (_, h) => selectOption(`${h} 时`, String(h)))
+}
+function minuteOptions(): object[] {
+  return Array.from({ length: 12 }, (_, i) => String(i * 5).padStart(2, "0")).map((m) => selectOption(`${m} 分`, String(Number(m))))
+}
+
+/**
+ * 订阅表单卡：用户发「资讯订阅」弹出。频率/时间全部点选（option value 直接
+ * 编码调度参数，提交零解析），内容自由填写；form 提交时 action.form_value
+ * 带上全部字段值，由 interactions 的 cron-sub 分支组装成 cron 任务。
+ * 传入 edit 时为编辑模式：预填原值，提交后替换原订阅（value.f 带原名）。
+ */
+/** 订阅频率选项：资讯/邮件订阅表单共用（value 对应 interactions 的 FREQ_TABLE）。 */
+const FREQ_PAIRS: Array<[string, string]> = [
+  ["每天", "daily"],
+  ["每工作日（周一至周五）", "workday"],
+  ["每周一", "mon"],
+  ["每周二", "tue"],
+  ["每周三", "wed"],
+  ["每周四", "thu"],
+  ["每周五", "fri"],
+  ["每周六", "sat"],
+  ["每周日", "sun"],
+  ["每月 1 号", "dom1"],
+  ["每月 15 号", "dom15"],
+]
+
+export function subscribeCard(edit?: CronJobInfo): object {
+  const preset = edit ? scheduleToForm(edit.schedule) : {}
+  const nonce = nextFormNonce()
+  const freqOptions = FREQ_PAIRS.map(([label, value]) => selectOption(label, value))
+  const elements: object[] = [
+    {
+      tag: "markdown",
+      content: edit
+        ? `正在编辑订阅 **${escapeMarkdown(edit.name)}**，调整后提交即可替换。`
+        : "选择推送频率与时间、填写关注内容，我会按时把最新资讯推送到本会话。",
+    },
+    { tag: "markdown", content: "**📌 订阅内容**" },
+    {
+      tag: "input",
+      name: "prompt",
+      width: "fill",
+      // 编辑「邮件日报」等系统预设订阅时 default_value 是一整段指令（130+ 字），
+      // max_length 必须装得下，否则飞书拒绝渲染整张卡片，回调直接失败。
+      max_length: 500,
+      default_value: edit?.prompt,
+      placeholder: { tag: "plain_text", content: "如：FTTR 相关资讯、香港教育产品动向" },
+    },
+    { tag: "markdown", content: "**🔁 推送频率**" },
+    selectStatic("freq", edit ? `原频率：${humanSchedule(edit.schedule).replace(/\s+\d+:.*/, "")}` : "选择频率", freqOptions, preset.freq),
+    { tag: "markdown", content: "**🕘 推送时间（24 小时制）**" },
+    selectStatic("hour", edit ? `原时间：${humanSchedule(edit.schedule).match(/\d+:\d+$/)?.[0] ?? ""}` : "选择小时", hourOptions(), preset.hour),
+    selectStatic("minute", "选择分钟", minuteOptions(), preset.minute),
+    { tag: "hr" },
+    {
+      tag: "markdown",
+      content: "<font color='grey'>更复杂的周期（如每月 20 号）可直接发文字：订阅 每月20号 9:00 内容</font>",
+      text_size: "notation",
+    },
+    buttonRow([
+      formSubmitButton(edit ? "✅ 保存修改" : "✅ 创建订阅", { n: nonce, k: "cron-sub", f: edit?.name }, "primary", "submit"),
+      formSubmitButton("取消", { n: nonce, k: "cron-cancel", f: edit?.name, d: "资讯订阅" }, "default", "cancel"),
+    ]),
+  ]
+  return baseCard(edit ? "✏️ 编辑订阅" : "⏰ 新增资讯订阅", "blue", [{ tag: "form", name: "cron_sub", elements }])
+}
+
+/**
+ * 邮件类订阅判定：「邮件订阅」创建的管理任务名称固定含「邮件」、prompt 含 S64
+ * 技能标识；用户文字订阅里名字带「邮件/邮箱」的也归入邮件组。其余算资讯订阅。
+ */
+export function isMailJob(job: CronJobInfo): boolean {
+  return /邮件|邮箱/.test(job.name) || /S64|邮件查收/.test(job.prompt)
+}
+
+/** 邮件订阅表单的编辑上下文：名称 + 原调度（日报逻辑固定，编辑只改频率/时间）。 */
+export interface MailSubscribeEdit {
+  name: string
+  schedule: string
+}
+
+/**
+ * 邮件订阅表单卡：用户发「邮件订阅」弹出。表单只有「总结频率 + 推送时间」——
+ * 日报逻辑固定（着重列出需要尽快回复的邮件、未来两周内有截止日期的事项，
+ * 范围随频率：每天→前一天，每周→前一周，每月→前 30 天），用户无需填写任何
+ * 要求。提交走 cron-mail-sub，由 interactions 组装成 cron 任务。
+ */
+export function mailSubscribeCard(edit?: MailSubscribeEdit, mailboxMissing = false): object {
+  const preset = edit ? scheduleToForm(edit.schedule) : {}
+  const nonce = nextFormNonce()
+  const freqOptions = FREQ_PAIRS.map(([label, value]) => selectOption(label, value))
+  const elements: object[] = [
+    {
+      tag: "markdown",
+      content: edit
+        ? `正在编辑 **${escapeMarkdown(edit.name)}**，调整后提交即可替换。`
+        : "选择总结频率和时间即可，日报逻辑是固定的：按时整理你的收件箱，**着重列出需要尽快回复的邮件、未来两周内有截止日期需要你处理的事项**；没有就直说没有。\n重要性「高」的新邮件会实时单独推送，不必等日报。",
+    },
+    { tag: "markdown", content: "**🔁 总结频率**" },
+    selectStatic("freq", edit ? `原频率：${humanSchedule(edit.schedule).replace(/\s+\d+:.*/, "")}` : "选择频率", freqOptions, preset.freq),
+    { tag: "markdown", content: "**🕘 推送时间（24 小时制）**" },
+    selectStatic("hour", edit ? `原时间：${humanSchedule(edit.schedule).match(/\d+:\d+$/)?.[0] ?? ""}` : "选择小时", hourOptions(), preset.hour),
+    selectStatic("minute", "选择分钟", minuteOptions(), preset.minute),
+  ]
+  if (mailboxMissing) {
+    elements.push({
+      tag: "markdown",
+      content: "<font color='orange'>⚠️ 你还没绑定邮箱——提交后发一句「绑定邮箱」，我会自动绑定你飞书账号登记的邮箱（只能绑自己的）。</font>",
+      text_size: "notation",
+    })
+  }
+  elements.push(
+    { tag: "hr" },
+    {
+      tag: "markdown",
+      content: "<font color='grey'>总结范围随频率：每天一次总结前一天，每周一次总结前一周，每月一次总结前 30 天。邮箱接口只读：不会删除、移动、标记或回复任何邮件。想自动转发请在飞书邮箱 App 的「设置 > 收信规则」里配置。</font>",
+      text_size: "notation",
+    },
+    buttonRow([
+      formSubmitButton(edit ? "✅ 保存修改" : "✅ 开启邮件管理", { n: nonce, k: "cron-mail-sub", f: edit?.name }, "primary", "submit"),
+      formSubmitButton("取消", { n: nonce, k: "cron-cancel", f: edit?.name, d: "邮件订阅" }, "default", "cancel"),
+    ]),
+  )
+  return baseCard(edit ? "✏️ 编辑邮件管理" : "📮 新增邮件订阅", "blue", [{ tag: "form", name: "cron_mail_sub", elements }])
+}
+
+/** 订阅表单「取消」后的替换卡：编辑态确认原订阅未动，新建态给菜单指引。 */
+export function cronFormCancelCard(editingName?: string, menuLabel?: string): object {
+  const content = editingName
+    ? `已取消编辑，**${escapeMarkdown(editingName)}** 保持原样不变。\n管理订阅：点击下方菜单「订阅 > 我的订阅」。`
+    : `已取消，没有创建订阅。\n想重新开始：点击下方菜单「订阅 > ${menuLabel ?? "资讯订阅"}」。`
+  return statusCard("已取消", content, "grey")
+}
+
+/** 订阅管理卡：按「邮件订阅 / 资讯订阅」分组，列表 + 暂停/编辑/删除，全部点选操作。 */
+export function cronManageCard(jobs: CronJobInfo[]): object {
+  // A fresh nonce per render keeps every button payload unique: the card is
+  // updated in place after each action, and without it the SDK's 12h click
+  // dedup would swallow the second click on the same toggle.
+  const nonce = nextFormNonce()
+  const elements: object[] = []
+  if (jobs.length === 0) {
+    elements.push({ tag: "markdown", content: "暂无订阅。\n点击下方菜单「订阅 > 资讯订阅」或「订阅 > 邮件订阅」即可创建。" })
+  }
+  const pushJob = (job: CronJobInfo, index: number) => {
+    const status = job.enabled
+      ? `🟢 ${humanSchedule(job.schedule)}${job.next ? ` · 下次 ${job.next}` : ""}${job.urgent ? " · 🔔加急" : ""}`
+      : "⏸ 已暂停"
+    // 邮件类订阅的 prompt 是一段技术性指令，主标题直接显示名称更友好；
+    // 资讯订阅保持原样（prompt 截断为主标题，灰色小字显示名称）。
+    const mail = isMailJob(job)
+    const title = mail ? job.name : job.prompt.slice(0, 40)
+    const sub = mail ? escapeMarkdown(status) : `${escapeMarkdown(job.name)} · ${escapeMarkdown(status)}`
+    elements.push({
+      tag: "markdown",
+      content: `**${index + 1}. ${escapeMarkdown(title)}**\n<font color='grey'>${sub}</font>`,
+    })
+    const buttons: object[] = [
+      callbackButton(job.enabled ? "⏸ 暂停" : "▶ 恢复", { n: nonce, k: "cron-pause", d: job.name }, job.enabled ? "default" : "primary"),
+      callbackButton(job.urgent ? "🔕 静音" : "🔔 提醒", { n: nonce, k: "cron-urgent", d: job.name }),
+    ]
+    if (job.enabled) buttons.push(callbackButton("✏️ 编辑", { n: nonce, k: "cron-edit", d: job.name }))
+    buttons.push(callbackButton("🗑 删除", { n: nonce, k: "cron-del", d: job.name }, "danger"))
+    elements.push(buttonRow(buttons))
+  }
+  const groups: Array<[string, CronJobInfo[]]> = [
+    ["📮 邮件订阅", jobs.filter(isMailJob)],
+    ["📰 资讯订阅", jobs.filter((j) => !isMailJob(j))],
+  ]
+  groups
+    .filter(([, list]) => list.length > 0)
+    .forEach(([title, list], gi) => {
+      if (gi > 0) elements.push({ tag: "hr" })
+      elements.push({ tag: "markdown", content: `**${title}**（${list.length}）` })
+      list.forEach((job, i) => {
+        pushJob(job, i)
+        if (i < list.length - 1) elements.push({ tag: "hr" })
+      })
+    })
+  if (jobs.length > 0) elements.push({ tag: "hr" })
+  elements.push({
+    tag: "markdown",
+    content: "<font color='grey'>点击菜单「订阅 > 资讯订阅」或「订阅 > 邮件订阅」新建订阅 · 操作后列表即时刷新</font>",
+    text_size: "notation",
+  })
+  return baseCard("📋 我的订阅", "blue", elements)
+}
+
+/** 删除二次确认卡。 */
+export function cronDeleteConfirmCard(name: string): object {
+  const nonce = nextFormNonce()
+  return baseCard("🗑 删除订阅", "red", [
+    { tag: "markdown", content: `确认删除订阅 **${escapeMarkdown(name)}**？删除后不可恢复。` },
+    buttonRow([
+      callbackButton("✅ 确认删除", { n: nonce, k: "cron-del-yes", d: name }, "danger"),
+      callbackButton("↩ 返回列表", { n: nonce, k: "cron-mgr" }),
+    ]),
+  ])
+}
+
 export function helpCard(): object {
   const commands = [
-    "/new — 开启一个全新会话",
-    "/reset — 重置并新建会话",
-    "/sessions — 列出当前会话",
-    "/agent <name> — 切换 Agent",
-    "/model <provider/model> — 切换模型",
-    "/stop — 中断当前执行",
-    "/export — 导出当前会话（迁移用）",
-    "/import <json> — 导入会话（迁移用）",
-    "/answer <formId> key=value — 回答 AI 提问",
-    "/cron list | add … — 管理定时任务",
-    "/whoami — 显示当前绑定信息",
-    "/help — 显示本帮助",
+    "**新建对话** — 点击下方菜单，开启一个全新会话",
+    "**停止生成** — 点击下方菜单，停掉正在进行的任务",
+    "**资讯订阅** — 点击菜单「订阅 > 资讯订阅」，在弹出的卡片里点选频率、时间并填写内容即可\n  也可直接发文字：订阅 每周一 9:00 FTTR 相关资讯",
+    "**邮件订阅** — 点击菜单「订阅 > 邮件订阅」，选择频率和时间即可：按时整理收件箱推送日报，着重列出需要尽快回复的邮件和截止日期临近的事项；重要邮件实时推送\n  首次使用先发「绑定邮箱」：自动绑定你飞书账号登记的邮箱（只能绑自己的，填别人的地址会被拒绝）",
+    "**我的订阅** — 点击菜单「订阅 > 我的订阅」弹出管理卡片：查看全部订阅，可暂停 / 恢复 / 编辑 / 删除",
+    "**模板库** — 发送「模板库」查看 PPT 模板（发 .pptx 并写「存为模板 名字」可新增）",
+    "**帮助** — 点击下方菜单，显示本帮助",
   ]
-  return baseCard("🤖 OpenCode 机器人", "blue", [
-    { tag: "markdown", content: "我可以把你的消息转发给 OpenCode，并实时流式回复。\n\n**支持：**\n- 文本、图片、文件（图片/文本会作为上下文附件）\n- 交互式卡片授权与提问\n- 每个会话独立目录，上下文互不干扰\n- 定时任务、会话迁移" },
+  return baseCard("🤖 产品中心智能助手", "blue", [
+    { tag: "markdown", content: "我可以把你的消息转发给产品中心智能助手，并实时流式回复。\n\n**支持：**\n- 文本、图片、文件（图片/文本会作为上下文附件）\n- 交互式卡片授权与提问\n- 每个会话独立目录，上下文互不干扰\n- 定时任务、会话迁移" },
     { tag: "hr" },
-    { tag: "markdown", content: commands.map((c) => `- \`${c}\``).join("\n") },
+    { tag: "markdown", content: commands.map((c) => `- ${c}`).join("\n") },
   ])
 }

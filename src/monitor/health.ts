@@ -18,7 +18,6 @@ export interface HealthMonitorDeps {
 export class HealthMonitor {
   private timer?: NodeJS.Timeout
   private healthy = true
-  private lastError?: string
 
   constructor(private readonly deps: HealthMonitorDeps) {}
 
@@ -39,7 +38,6 @@ export class HealthMonitor {
     if (result.ok) {
       if (!this.healthy) {
         this.healthy = true
-        this.lastError = undefined
         this.deps.logger.info("OpenCode recovered", result.info ? { version: result.info.version } : undefined)
         this.deps.audit.record("opencode.recovered", result.info ?? {})
         await this.safeAlert("✅ OpenCode 已恢复健康。")
@@ -47,7 +45,6 @@ export class HealthMonitor {
       return true
     }
 
-    this.lastError = result.error
     this.deps.logger.warn("OpenCode health check failed", {
       error: result.error,
       failures: this.deps.service.failures,

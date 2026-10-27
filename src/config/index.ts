@@ -99,7 +99,41 @@ const CronJobSchema = z.object({
   prompt: z.string(),
   /** Optional user id used for the isolated folder when perUserInGroup is on. */
   userId: z.string().optional(),
+  /** Open ID of the subscriber, used as the urgent reminder target. */
+  ownerOpenId: z.string().optional(),
+  /** Whether to send an in-app urgent reminder after delivery. Defaults on. */
+  urgent: z.boolean().default(true),
   enabled: z.boolean().default(true),
+})
+
+/** Poll a Feishu mailbox and push agent-triaged important mail to a chat. */
+const MailWatchSchema = z.object({
+  enabled: z.boolean().default(false),
+  /** The mailbox address to poll. Empty disables the watcher at runtime. */
+  mailbox: z.string().default(""),
+  /** Bot whose credentials call the mail API and whose agent triages. */
+  bot: z.string().default("assistant"),
+  /** Chat that receives the important-mail card. */
+  chatId: z.string().default(""),
+  intervalMinutes: z.number().min(1).default(2),
+  /** Urgent-reminder target for pushed mail; empty skips the bell. */
+  ownerOpenId: z.string().default(""),
+  /**
+   * Loopback port for the agent-facing read-only mail proxy. The agent never
+   * sees mail credentials — it calls this proxy, which resolves the mailbox
+   * from the bridge-owned binding file. 0 disables the proxy.
+   */
+  proxyPort: z.number().int().min(0).max(65535).default(4097),
+})
+
+const RetentionSchema = z.object({
+  /** Days an uploaded source file stays under a session's inbox/. */
+  inboxDays: z.number().positive().default(7),
+  /** Days a downloaded copy stays under file-cache/. */
+  cacheDays: z.number().positive().default(14),
+  /** Days a finished deliverable stays under a session's deliverables/. */
+  deliverableDays: z.number().positive().default(30),
+  sweepIntervalMs: z.number().int().positive().default(6 * 60 * 60 * 1000),
 })
 
 const ConfigSchema = z.object({
@@ -108,14 +142,20 @@ const ConfigSchema = z.object({
   opencode: OpenCodeSchema.default({}),
   bots: z.array(BotSchema).min(1),
   cron: z.array(CronJobSchema).default([]),
+  mail: MailWatchSchema.default({}),
+  retention: RetentionSchema.default({}),
+  /** OpenIds allowed to save/overwrite shared templates. Everyone can use them. */
+  templateAdmins: z.array(z.string()).default([]),
 })
 
 export type ModelRef = z.infer<typeof ModelRefSchema>
 export type OpenCodeConfig = z.infer<typeof OpenCodeSchema>
 export type BotConfig = z.infer<typeof BotSchema>
 export type CronJobConfig = z.infer<typeof CronJobSchema>
+export type MailWatchConfig = z.infer<typeof MailWatchSchema>
 export type AccessConfig = z.infer<typeof AccessSchema>
 export type StreamingConfig = z.infer<typeof StreamingSchema>
+export type RetentionConfig = z.infer<typeof RetentionSchema>
 export type AppConfig = z.infer<typeof ConfigSchema>
 
 export interface LoadedConfig {

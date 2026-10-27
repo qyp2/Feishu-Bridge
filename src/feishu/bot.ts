@@ -42,6 +42,8 @@ export class FeishuBot {
   private readonly logger: Logger
   private readonly handlers: BotHandlers
   private connected = false
+  /** Feishu rejects a card sequence above 2^31-1, so this stays in unix seconds. */
+  private cardSequence = 0
 
   constructor(config: BotConfig, logger: Logger, handlers: BotHandlers) {
     this.config = config
@@ -60,6 +62,14 @@ export class FeishuBot {
         dmMode: config.access.allowUsers.length > 0 ? "allowlist" : "open",
         dmAllowlist: config.access.allowUsers,
         requireMention: config.requireMention,
+      },
+      // A file and the following instruction arrive as separate messages. The
+      // SDK's default batch keeps only the last message id and then the file
+      // download is rejected with HTTP 400. Flush each message on its own.
+      safety: {
+        batch: {
+          text: { delayMs: 0, maxMessages: 1 },
+        },
       },
       outbound: {
         streamThrottleMs: config.streaming.intervalMs,
@@ -151,6 +161,47 @@ export class FeishuBot {
     return this.channel.updateCard(messageId, card)
   }
 
+  /**
+   * Refresh a streaming card that lost its live turn, without turning streaming off.
+   * The sequence must stay inside a signed 32-bit integer; a millisecond timestamp is rejected.
+   */
+  async pushProgressCard(cardId: string, markdown: string): Promise<void> {
+    const sequence = this.nextCardSequence()
+    await this.raw.cardkit.v1.cardElement.content({
+      path: { card_id: cardId, element_id: "stream_md" },
+      data: { content: markdown, sequence, uuid: `p_${cardId}_${sequence}` },
+    })
+  }
+
+  /**
+   * Write the final text onto a cardkit streaming card and turn streaming off,
+   * so a card abandoned by a restart does not keep its spinner.
+   */
+  async finishProgressCard(cardId: string, markdown: string): Promise<void> {
+    const sequence = this.nextCardSequence()
+    const summary = markdown.replace(/\s+/g, " ").trim().slice(0, 60) || "处理完成"
+    await this.raw.cardkit.v1.cardElement.content({
+      path: { card_id: cardId, element_id: "stream_md" },
+      data: { content: markdown, sequence, uuid: `c_${cardId}_${sequence}` },
+    })
+    const closing = this.nextCardSequence()
+    await this.raw.cardkit.v1.card.settings({
+      path: { card_id: cardId },
+      data: {
+        settings: JSON.stringify({ config: { streaming_mode: false, summary: { content: summary } } }),
+        sequence: closing,
+        uuid: `s_${cardId}_${closing}`,
+      },
+    })
+  }
+
+  /** Next cardkit sequence. Feishu requires a strictly increasing int32. */
+  private nextCardSequence(): number {
+    const now = Math.floor(Date.now() / 1000)
+    this.cardSequence = Math.max(this.cardSequence + 1, now)
+    return this.cardSequence
+  }
+
   async downloadResource(fileKey: string, type: "image" | "file"): Promise<Buffer> {
     return this.channel.downloadResource(fileKey, type)
   }
@@ -167,16 +218,40 @@ export class FeishuBot {
     messageId: string,
     fileKey: string,
     type: "image" | "file" | "audio" | "video",
+    alsoTry: string[] = [],
   ): Promise<Buffer> {
-    const raw = await this.raw.im.v1.messageResource.get({
-      path: { message_id: messageId, file_key: fileKey },
-      params: { type },
-    })
-    return streamToBuffer(raw)
+    const apiType = type === "image" ? "image" : "file"
+    const ids = [...new Set([messageId, ...alsoTry].filter((id) => id.length > 0))]
+    let lastError: unknown
+    for (const id of ids) {
+      try {
+        const raw = await this.raw.im.v1.messageResource.get({
+          path: { message_id: id, file_key: fileKey },
+          params: { type: apiType },
+        })
+        return streamToBuffer(raw)
+      } catch (error) {
+        const detail = errorBody(error)
+        releaseErrorStream(error)
+        const message = error instanceof Error ? error.message : "Failed to download message resource"
+        lastError = new Error(detail ? `${message}: ${detail}` : message)
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error("Failed to download message resource")
   }
 
   async getChatInfo(chatId: string): Promise<ChatInfo> {
     return this.channel.getChatInfo(chatId)
+  }
+
+  /**
+   * Download a file stored in Feishu Drive (云空间文件, URL 形如 /file/<token>).
+   * Requires the app's drive download permission; callers surface failures as
+   * user-facing guidance rather than breaking the flow.
+   */
+  async downloadDriveFile(fileToken: string): Promise<Buffer> {
+    const raw = await this.raw.drive.v1.file.download({ path: { file_token: fileToken } })
+    return streamToBuffer(raw)
   }
 
   stream(
@@ -190,6 +265,19 @@ export class FeishuBot {
   /** Low level client for card entity / message APIs the channel does not wrap. */
   get raw(): Lark.Client {
     return this.channel.rawClient
+  }
+
+  /**
+   * In-app urgent reminder (响铃强提醒) for a delivered message. Callers catch:
+   * delivery must never depend on the urgent permission being granted.
+   */
+  async urgentApp(messageId: string, openIds: string[]): Promise<void> {
+    if (openIds.length === 0) return
+    await this.raw.im.message.urgentApp({
+      path: { message_id: messageId },
+      params: { user_id_type: "open_id" },
+      data: { user_id_list: openIds },
+    })
   }
 }
 
@@ -213,4 +301,24 @@ function streamToBuffer(raw: unknown): Promise<Buffer> {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function errorBody(error: unknown): string {
+  const data = (error as { response?: { data?: unknown } } | undefined)?.response?.data
+  if (typeof data === "string") return data.slice(0, 300)
+  if (Buffer.isBuffer(data)) return data.toString("utf8").slice(0, 300)
+  if (data && typeof data === "object" && typeof (data as { pipe?: unknown }).pipe !== "function") {
+    try {
+      return JSON.stringify(data).slice(0, 300)
+    } catch {
+      return ""
+    }
+  }
+  return ""
+}
+
+/** A failed streamed download leaves the response body open and can stall the next request. */
+function releaseErrorStream(error: unknown): void {
+  const data = (error as { response?: { data?: { destroy?: () => void } } } | undefined)?.response?.data
+  if (data && typeof data.destroy === "function") data.destroy()
 }

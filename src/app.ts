@@ -5,10 +5,14 @@ import { ensureDir } from "./util/paths.js"
 import { OpencodeService } from "./opencode/service.js"
 import { OpencodeEventBus } from "./opencode/events.js"
 import { BindingStore } from "./storage/bindings.js"
+import { Janitor } from "./storage/janitor.js"
 import { FeishuBot } from "./feishu/bot.js"
 import { ConversationService } from "./core/conversations.js"
 import { InteractionService } from "./core/interactions.js"
 import { CronManager } from "./scheduler/cron.js"
+import { MailWatcher } from "./scheduler/mailwatch.js"
+import { MailBindingStore } from "./mail/binding.js"
+import { MailProxy } from "./mail/proxy.js"
 import { HealthMonitor } from "./monitor/health.js"
 
 /**
@@ -25,10 +29,14 @@ export class App {
   private readonly conversations: ConversationService
   private readonly interactions: InteractionService
   private readonly cron: CronManager
+  private readonly mailBinding: MailBindingStore
+  private readonly mailwatch: MailWatcher
+  private readonly mailProxy: MailProxy
   private readonly health: HealthMonitor
+  private readonly janitor: Janitor
   private started = false
 
-  constructor(private readonly loaded: LoadedConfig) {
+  constructor(loaded: LoadedConfig) {
     const { config } = loaded
     this.storageDir = config.storageDir
     const logDir = ensureDir(path.join(this.storageDir, "logs"))
@@ -52,10 +60,15 @@ export class App {
     this.interactions = new InteractionService({
       logger: this.logger.child("interaction"),
       audit: this.audit,
+      conversations: this.conversations,
       getClient: () => this.service.client(),
       getBot: (name) => this.bots.get(name),
       getContext: (sessionID) => this.conversations.getContext(sessionID),
       activeSessions: () => this.conversations.activeSessions(),
+      completeGapFill: (bot, token, answers, messageId) =>
+        this.conversations.completeGapFill(bot, token, answers, messageId),
+      // Resolved lazily: the cron manager is constructed a few lines below.
+      getCron: () => this.cron,
     })
 
     this.cron = new CronManager({
@@ -66,6 +79,24 @@ export class App {
       storageDir: this.storageDir,
     })
 
+    this.mailBinding = new MailBindingStore(this.storageDir)
+
+    this.mailwatch = new MailWatcher({
+      config,
+      conversations: this.conversations,
+      logger: this.logger.child("mailwatch"),
+      audit: this.audit,
+      storageDir: this.storageDir,
+      binding: this.mailBinding,
+    })
+
+    this.mailProxy = new MailProxy({
+      config,
+      binding: this.mailBinding,
+      logger: this.logger.child("mailproxy"),
+      audit: this.audit,
+    })
+
     this.health = new HealthMonitor({
       config: config.opencode,
       service: this.service,
@@ -74,8 +105,11 @@ export class App {
       alert: (message) => this.broadcastAlert(message),
     })
 
+    this.janitor = new Janitor(config, this.logger.child("janitor"))
+
     this.conversations.commandHandler.setFormAnswerHandler(this.interactions)
     this.conversations.commandHandler.setCronController(this.cron)
+    this.conversations.commandHandler.setMailBindingStore(this.mailBinding)
     this.conversations.setInteractionProbe((sessionID) => this.interactions.hasPending(sessionID))
 
     for (const botConfig of config.bots) {
@@ -112,7 +146,10 @@ export class App {
     this.eventBus.start()
     this.interactions.start()
     this.cron.start()
+    this.mailwatch.start()
+    this.mailProxy.start()
     this.health.start()
+    this.janitor.start()
 
     for (const bot of this.bots.values()) {
       try {
@@ -133,7 +170,10 @@ export class App {
   async stop(): Promise<void> {
     this.logger.info("Stopping feishu-bridge")
     this.health.stop()
+    this.janitor.stop()
     this.cron.stop()
+    this.mailwatch.stop()
+    this.mailProxy.stop()
     this.conversations.stopRecovery()
     this.interactions.stop()
     this.eventBus.stop()

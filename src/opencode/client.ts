@@ -1,3 +1,7 @@
+import fs from "node:fs"
+import path from "node:path"
+import { fileURLToPath } from "node:url"
+import { describeDocuments } from "../core/office.js"
 import type {
   AgentInfo,
   FormInfo,
@@ -7,6 +11,7 @@ import type {
   OpencodeEvent,
   PermissionReply,
   PermissionRequest,
+  PromptFileAttachment,
   PromptInput,
   SessionInfo,
 } from "./types.js"
@@ -83,12 +88,7 @@ export class OpencodeClient {
       }
     }
     if (!res.ok) {
-      const message =
-        parsed && typeof parsed === "object" && "message" in parsed
-          ? String((parsed as { message: unknown }).message)
-          : typeof parsed === "string"
-            ? parsed
-            : `HTTP ${res.status}`
+      const message = errorMessage(parsed, res.status)
       throw new OpencodeError(res.status, path, message, parsed)
     }
     return parsed as T
@@ -172,7 +172,12 @@ export class OpencodeClient {
   // ---- prompting ----------------------------------------------------------
 
   async prompt(sessionID: string, input: PromptInput): Promise<{ id: string }> {
-    return this.data("POST", `/api/session/${sessionID}/prompt`, { body: input })
+    // Parse saved office files only while handling an instruction. Upload itself only stores them.
+    const note = await describeDocuments(input.files)
+    const prepared = encodePromptFiles(`${input.text}${note}`, input.files)
+    return this.data("POST", `/api/session/${sessionID}/prompt`, {
+      body: { ...input, text: prepared.text, files: prepared.files },
+    })
   }
 
   async interrupt(sessionID: string): Promise<void> {
@@ -288,6 +293,58 @@ export class OpencodeClient {
       await res.body.cancel().catch(() => {})
     }
   }
+}
+
+const IMAGE_MIME: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+}
+
+interface ApiPromptFile {
+  data: string
+  mime: string
+  source: { type: "uri"; uri: string }
+  name?: string
+  description?: string
+}
+
+/**
+ * OpenCode only accepts image attachments, and `data` must be raw base64.
+ * A `file://` URI in that field fails schema validation and the prompt
+ * route returns HTTP 500. Documents stay on disk; their paths go in the text.
+ */
+function encodePromptFiles(
+  text: string,
+  files: PromptFileAttachment[] | undefined,
+): { text: string; files?: ApiPromptFile[] } {
+  const images: ApiPromptFile[] = []
+  for (const file of files ?? []) {
+    const filePath = file.uri.startsWith("file:") ? fileURLToPath(file.uri) : file.uri
+    const ext = path.extname(file.name ?? filePath).toLowerCase()
+    const mime = IMAGE_MIME[ext]
+    if (!mime) continue
+    images.push({
+      data: fs.readFileSync(filePath).toString("base64"),
+      mime,
+      source: { type: "uri", uri: file.uri },
+      name: file.name,
+      description: file.description,
+    })
+  }
+  return { text, files: images.length > 0 ? images : undefined }
+}
+
+function errorMessage(parsed: unknown, status: number): string {
+  if (parsed && typeof parsed === "object") {
+    const record = parsed as Record<string, unknown>
+    if (typeof record.message === "string" && record.message.trim()) return record.message
+    if (typeof record.error === "string" && record.error.trim()) return record.error
+  }
+  if (typeof parsed === "string" && parsed.trim()) return parsed.slice(0, 500)
+  return `HTTP ${status}`
 }
 
 function parseSseChunk(chunk: string): OpencodeEvent | undefined {
