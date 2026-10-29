@@ -34,6 +34,7 @@ import {
 import { fitCardMarkdown, isProgressShell, TurnAccumulator, spinnerFrame, type TranscriptMessage } from "./turn.js"
 import { CommandHandler } from "./commands.js"
 import { writeMailScope, type MailBindingStore } from "../mail/binding.js"
+import { renderSkillBlock, SkillStore, type Skill } from "../skills/store.js"
 
 export interface SessionContext {
   botName: string
@@ -89,6 +90,8 @@ export interface TurnRequest {
   cardTitle?: string
   /** Sender's openId, used to resolve personal templates. */
   userOpenId?: string
+  /** 用户从卡片/命令点名要用的技能：跳过触发词匹配，直接套用。 */
+  forcedSkill?: Skill
 }
 
 export interface ConversationDeps {
@@ -164,6 +167,9 @@ function menuCommand(text: string): string {
   if (text === "停止生成") return "/stop"
   if (text === "帮助") return "/help"
   if (text === "模板库") return "/templates"
+  // 个性化技能：菜单里叫「我的技能」，也认「技能」「技能库」。
+  if (text === "技能" || text === "我的技能" || text === "技能库" || text === "管理技能") return "/skills"
+  if (text === "新建技能" || text === "创建技能" || text === "加个技能") return "/skill new"
   // 制作中心菜单（叶子节点发出的固定文本;「PPT 生成」与「生成 PPT」两种语序都认）。
   if (text === "文档制作" || text === "制作") return "/make doc"
   if (/^(?:PPT\s*(?:生成|制作)|生成\s*PPT)$/i.test(text)) return "/make ppt"
@@ -251,6 +257,8 @@ export class ConversationService {
   private readonly commands: CommandHandler
   private mailBinding?: MailBindingStore
   private readonly linkedProjects = new Set<string>()
+  /** 个性化技能库（桥接侧，按用户隔离）。 */
+  readonly skills: SkillStore
   private interactionProbe: (sessionID: string) => boolean = () => false
   private readonly gapInflight = new Set<string>()
   private recoveryTimer?: NodeJS.Timeout
@@ -262,6 +270,13 @@ export class ConversationService {
 
   constructor(private readonly deps: ConversationDeps) {
     this.commands = new CommandHandler(this)
+    this.skills = new SkillStore(this.deps.config.storageDir)
+  }
+
+  /** 技能管理员：沿用模板管理员名单，避免再维护一套白名单。 */
+  isSkillAdmin(openId?: string): boolean {
+    if (!openId) return false
+    return (this.deps.config.templateAdmins ?? []).includes(openId)
   }
 
   /**
@@ -538,6 +553,45 @@ export class ConversationService {
         error: error instanceof Error ? error.message : String(error),
       })
     })
+  }
+
+  /**
+   * 卡片「试用」/`/skill use`：点名套用一条技能，立刻跑一次示范。
+   * 走 forcedSkill，不依赖触发词是否出现在这句话里。
+   */
+  async runSkillTrial(bot: FeishuBot, identity: ChatIdentity, skill: Skill, replyTo?: string): Promise<void> {
+    const binding = await this.ensureSession(bot, identity, identity.chatId)
+    await this.runTurn({
+      bot,
+      binding,
+      replyTo,
+      text: `请按技能「${skill.name}」示范一次：如果现在要你按它干活，你会交出什么。缺资料就用假设补齐，并在结尾列出这些假设。`,
+      source: "user",
+      userOpenId: identity.senderId,
+      forcedSkill: skill,
+    })
+  }
+
+  /**
+   * 卡片回调里的「试用」：卡片事件不带 chatType，这里以该会话已有的绑定为准，
+   * 避免 perUserInGroup 的群聊被误判成私聊而新建一个平行绑定。
+   */
+  async runSkillTrialInChat(
+    bot: FeishuBot,
+    chatId: string,
+    senderId: string,
+    senderName: string,
+    skill: Skill,
+    replyTo?: string,
+  ): Promise<void> {
+    const known = this.deps.bindings.all().find((item) => item.bot === bot.name && item.chatId === chatId)
+    const identity: ChatIdentity = {
+      chatId,
+      chatType: (known?.chatType as "p2p" | "group" | undefined) ?? "p2p",
+      senderId,
+      senderName,
+    }
+    await this.runSkillTrial(bot, identity, skill, replyTo)
   }
 
   /** Run a scheduled prompt against a chat as if the user sent it. */
@@ -1208,9 +1262,21 @@ export class ConversationService {
     }
     return this.serial.run(binding.key, async () => {
       const startedAt = Date.now()
+      // 个性化技能：显式点名（卡片「试用」/`/skill use`）优先，否则按发送者的消息做触发词匹配。
+      const applied: Skill[] = request.forcedSkill
+        ? [request.forcedSkill]
+        : request.source === "user" && request.userOpenId
+          ? this.skills.match(request.text, request.userOpenId).map((hit) => hit.skill)
+          : []
+      const skillPrompt =
+        applied.length > 0 ? `${request.text}\n\n---\n${applied.map(renderSkillBlock).join("\n\n")}` : request.text
       const client = await this.deps.opencode.client()
       const accumulator = new TurnAccumulator(bot.config.streaming.showTools, bot.config.streaming.showReasoning)
       if (!request.silent && request.cardTitle) accumulator.titlePrefix = request.cardTitle
+      if (applied.length > 0) {
+        const names = applied.map((skill) => skill.name).join("、")
+        accumulator.titlePrefix = accumulator.titlePrefix ? `${accumulator.titlePrefix} · 🧩 ${names}` : `🧩 ${names}`
+      }
       const renderQueue = new AsyncQueue<void>()
       const throttle = createThrottle(bot.config.streaming.intervalMs)
       const signalRender = () => throttle(() => renderQueue.push())
@@ -1318,7 +1384,7 @@ export class ConversationService {
       state.priorMessageIDs = await this.priorAssistantIDs(client, binding.sessionID)
       try {
         await client.prompt(binding.sessionID, {
-          text: request.text,
+          text: skillPrompt,
           files: promptFiles,
         })
         accepted = true
@@ -1339,7 +1405,12 @@ export class ConversationService {
           source: request.source,
           text: request.text.slice(0, 500),
           attachments: promptFiles.length,
+          skills: applied.map((skill) => skill.name),
         })
+        for (const skill of applied) {
+          this.skills.markUsed(skill)
+          this.deps.audit.record("skill.applied", { bot: bot.name, chatId: binding.chatId, skill: skill.name })
+        }
         await completion
       } catch (error) {
         failure = error instanceof Error ? error.message : String(error)

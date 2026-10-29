@@ -114,6 +114,13 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => void shutdown("SIGTERM"))
 }
 
+// 一次飞书 API 失败（比如服务端拒收某张卡片）不该让整个机器人下线：
+// 记录日志后继续服务，下次交互照常。
+process.on("unhandledRejection", (reason) => {
+  const detail = reason instanceof Error ? reason.stack ?? reason.message : String(reason)
+  process.stderr.write(`[unhandledRejection] ${detail}\n`)
+})
+
 main().catch((error) => {
   process.stderr.write(`启动失败：${error instanceof Error ? error.stack ?? error.message : String(error)}\n`)
   process.exit(1)

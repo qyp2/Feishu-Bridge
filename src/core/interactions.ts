@@ -5,8 +5,9 @@ import type { AuditLog, Logger } from "../util/logger.js"
 import { bindCardOwner, mentionsFor, type FeishuBot } from "../feishu/bot.js"
 import type { ChatIdentity, ConversationService, SessionContext } from "./conversations.js"
 import { buildMailDigestPrompt, lookupUserEmail, type CronController, type CronJobInfo } from "./commands.js"
-import { cronDeleteConfirmCard, cronFormCancelCard, cronManageCard, formCard, isMailJob, loginCard, loginDoneCard, mailJobName, mailSubscribeCard, makeFormCard, makeSubmittedCard, permissionCard, statusCard, studioCard, studioPendingCard, studioResultCard, subscribeCard, type CardValue, type StudioDraft, type StudioKind } from "../feishu/cards.js"
+import { cronDeleteConfirmCard, cronFormCancelCard, cronManageCard, formCard, isMailJob, loginCard, loginDoneCard, mailJobName, mailSubscribeCard, makeFormCard, makeSubmittedCard, permissionCard, skillDeleteConfirmCard, skillFormCard, skillManageCard, skillSavedCard, statusCard, studioCard, studioPendingCard, studioResultCard, subscribeCard, type CardValue, type SkillFormDraft, type StudioDraft, type StudioKind } from "../feishu/cards.js"
 import { CONFIG_CHANGE_DENIED, isProtectedConfigTarget } from "./configGuard.js"
+import { parseTriggers, type SkillDraft } from "../skills/store.js"
 import { KeyedSerial } from "../util/async.js"
 import type { MailBindingStore } from "../mail/binding.js"
 
@@ -294,6 +295,26 @@ export class InteractionService {
       await this.resolveStudio(bot, event, value)
     } else if (value.k === "login") {
       await this.resolveLogin(bot, event, value)
+    } else if (value.k === "skill-mgr") {
+      await this.refreshSkillManage(bot, event)
+    } else if (value.k === "skill-new") {
+      await bot.updateCard(
+        event.messageId,
+        skillFormCard({}, { isAdmin: this.deps.conversations.isSkillAdmin(event.operator.openId) }),
+      )
+    } else if (value.k === "skill-edit" && value.d) {
+      await this.openSkillForm(bot, event, value.d)
+    } else if (value.k === "skill-del" && value.d) {
+      const skill = this.deps.conversations.skills.get(event.operator.openId, value.d)
+      if (skill) await bot.updateCard(event.messageId, skillDeleteConfirmCard(skill))
+    } else if (value.k === "skill-del-yes" && value.d) {
+      await this.resolveSkillDelete(bot, event, value.d)
+    } else if (value.k === "skill-save") {
+      await this.resolveSkillSave(bot, event, value)
+    } else if (value.k === "skill-cancel") {
+      await this.refreshSkillManage(bot, event, "已取消，技能没有改动。")
+    } else if (value.k === "skill-use" && value.d) {
+      await this.resolveSkillUse(bot, event, value.d)
     }
   }
 
@@ -376,6 +397,113 @@ export class InteractionService {
     await bot.updateCard(event.messageId, studioPendingCard())
     await new Promise((resolve) => setTimeout(resolve, 1200))
     await bot.updateCard(event.messageId, studioResultCard(filled))
+  }
+
+  // ---- 个性化技能 ----------------------------------------------------------
+
+  /** 重新渲染技能管理卡；message 非空时在顶部加一行结果说明（取消/删除后回显）。 */
+  private async refreshSkillManage(bot: FeishuBot, event: CardActionEvent, message?: string): Promise<void> {
+    const openId = event.operator.openId
+    const card = skillManageCard(
+      this.deps.conversations.skills.list(openId),
+      this.deps.conversations.isSkillAdmin(openId),
+    )
+    if (message) {
+      const body = card as { body?: { elements?: unknown[] } }
+      body.body?.elements?.unshift({ tag: "markdown", content: `<font color='grey'>${message}</font>` })
+    }
+    await bot.updateCard(event.messageId, card)
+  }
+
+  /** 打开编辑表单：把已有技能回填进表单。 */
+  private async openSkillForm(bot: FeishuBot, event: CardActionEvent, id: string): Promise<void> {
+    const skill = this.deps.conversations.skills.get(event.operator.openId, id)
+    if (!skill) {
+      await this.refreshSkillManage(bot, event, "这条技能已经不在了。")
+      return
+    }
+    const draft: SkillFormDraft = {
+      id: skill.id,
+      name: skill.name,
+      triggers: skill.triggers,
+      scene: skill.scene,
+      steps: skill.steps,
+      output: skill.output,
+      scope: skill.scope,
+    }
+    await bot.updateCard(
+      event.messageId,
+      skillFormCard(draft, { isAdmin: this.deps.conversations.isSkillAdmin(event.operator.openId) }),
+    )
+  }
+
+  private async resolveSkillDelete(bot: FeishuBot, event: CardActionEvent, id: string): Promise<void> {
+    const openId = event.operator.openId
+    const removed = this.deps.conversations.skills.remove(openId, id, {
+      allowShared: this.deps.conversations.isSkillAdmin(openId),
+    })
+    if (!removed) {
+      await this.refreshSkillManage(bot, event, "这条技能不存在，或你没有权限删除。")
+      return
+    }
+    this.deps.audit.record("skill.deleted", { chatId: event.chatId, operator: openId, skill: removed.name })
+    await this.refreshSkillManage(bot, event, `已删除技能「${removed.name}」。`)
+  }
+
+  /** 表单提交：校验 → 落盘 → 换成「已保存」卡（带试用按钮）。 */
+  private async resolveSkillSave(bot: FeishuBot, event: CardActionEvent, value: CardValue): Promise<void> {
+    const openId = event.operator.openId
+    const isAdmin = this.deps.conversations.isSkillAdmin(openId)
+    const values = extractFormValues(event)
+    const draft: SkillDraft = {
+      id: value.d,
+      name: String(values.name ?? "").trim(),
+      triggers: parseTriggers(String(values.triggers ?? "")),
+      scene: String(values.scene ?? "").trim(),
+      steps: String(values.steps ?? "").trim(),
+      output: String(values.output ?? "").trim(),
+      scope: String(values.scope ?? "") === "shared" ? "shared" : "personal",
+    }
+    try {
+      const skill = this.deps.conversations.skills.save(openId, draft, {
+        allowShared: isAdmin,
+        ownerName: event.operator.name,
+      })
+      this.deps.audit.record("skill.saved", {
+        chatId: event.chatId,
+        operator: openId,
+        skill: skill.name,
+        scope: skill.scope,
+        updated: Boolean(draft.id),
+      })
+      await bot.updateCard(event.messageId, skillSavedCard(skill, isAdmin))
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      // 不替换卡片：表单原样留在聊天里，用户改掉出问题的那一格再提交即可。
+      this.deps.audit.record("skill.rejected", { chatId: event.chatId, operator: openId, reason })
+      await bot
+        .sendMarkdown(event.chatId, `⚠️ 没有保存：${reason}\n改好后在这张卡片上重新提交即可。`, {
+          replyTo: event.messageId,
+        })
+        .catch(() => {})
+    }
+  }
+
+  /** 「试用」：立刻按这条技能跑一次，让用户看到效果。 */
+  private async resolveSkillUse(bot: FeishuBot, event: CardActionEvent, id: string): Promise<void> {
+    const skill = this.deps.conversations.skills.get(event.operator.openId, id)
+    if (!skill) {
+      await this.refreshSkillManage(bot, event, "这条技能已经不在了。")
+      return
+    }
+    await this.deps.conversations.runSkillTrialInChat(
+      bot,
+      event.chatId,
+      event.operator.openId,
+      event.operator.name ?? "",
+      skill,
+      event.messageId,
+    )
   }
 
   /** 「取消」:主动作废这张表单卡——编号消费,此后卡上所有按钮都不再可用。 */
