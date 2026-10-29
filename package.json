@@ -16,7 +16,10 @@
     "dev": "tsx watch src/index.ts",
     "service:install": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-service.ps1",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "doctor": "tsx src/index.ts doctor"
+    "doctor": "tsx src/index.ts doctor",
+    "verify:skills": "node scripts/verify-skills.mjs",
+    "verify:cards": "node scripts/verify-cards.mjs",
+    "verify:skill-injection": "node scripts/verify-skill-injection.mjs"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.75.0",

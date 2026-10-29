@@ -3,7 +3,8 @@ import path from "node:path"
 import type { NormalizedMessage } from "@larksuiteoapi/node-sdk"
 import type { ConversationService, ChatIdentity } from "./conversations.js"
 import type { FeishuBot } from "../feishu/bot.js"
-import { cronManageCard, escapeMarkdown, helpCard, mailSubscribeCard, makeFormCard, makePosterCard, markdownCard, statusCard, subscribeCard } from "../feishu/cards.js"
+import { cronManageCard, escapeMarkdown, helpCard, mailSubscribeCard, makeFormCard, makePosterCard, markdownCard, skillDeleteConfirmCard, skillFormCard, skillManageCard, skillSavedCard, statusCard, subscribeCard } from "../feishu/cards.js"
+import { describeSkill } from "../skills/store.js"
 import { ensureDir } from "../util/paths.js"
 import type { MailBindingStore } from "../mail/binding.js"
 
@@ -129,6 +130,8 @@ export class CommandHandler {
             `**Session：** \`${binding.sessionID}\``,
             `**Agent：** \`${binding.agent}\``,
             binding.model ? `**模型：** \`${binding.model.providerID}/${binding.model.id}\`` : "",
+            `**我的 OpenID：** \`${identity.senderId}\``,
+            this.conversations.isSkillAdmin(identity.senderId) ? "**技能管理员：** 是" : "",
           ].filter(Boolean).join("\n")),
           { replyTo: msg.messageId },
         )
@@ -220,6 +223,92 @@ export class CommandHandler {
           : "还没有保存的模板。发一个 .pptx 文件并写「存为模板 名字」即可保存个人模板。"
         const content = `${section("共享模板（全员可用）", shared)}\n\n${section("我的模板", personal)}\n\n${usage}`
         await bot.sendCard(identity.chatId, markdownCard("🧩 模板库", content), { replyTo: msg.messageId })
+        return true
+      }
+      case "skills": {
+        await bot.sendCard(
+          identity.chatId,
+          skillManageCard(this.conversations.skills.list(identity.senderId), this.conversations.isSkillAdmin(identity.senderId)),
+          { replyTo: msg.messageId },
+        )
+        return true
+      }
+      case "skill": {
+        const store = this.conversations.skills
+        const isAdmin = this.conversations.isSkillAdmin(identity.senderId)
+        const sub = (rest[0] ?? "").toLowerCase()
+        if (!sub || sub === "new" || sub === "add" || sub === "create") {
+          await bot.sendCard(identity.chatId, skillFormCard({}, { isAdmin }), { replyTo: msg.messageId })
+          return true
+        }
+        if (sub === "list" || sub === "ls") {
+          await bot.sendCard(identity.chatId, skillManageCard(store.list(identity.senderId), isAdmin), {
+            replyTo: msg.messageId,
+          })
+          return true
+        }
+        const target = rest.slice(1).join(" ").trim()
+        const skill = target ? store.get(identity.senderId, target) : undefined
+        if (!skill) {
+          await bot.sendText(
+            identity.chatId,
+            target
+              ? `没有找到技能「${target}」。发「技能」看看你现有的技能。`
+              : "用法：/skill new | list | show <名称> | use <名称> | del <名称>",
+            { replyTo: msg.messageId },
+          )
+          return true
+        }
+        if (sub === "use" || sub === "try" || sub === "run") {
+          await this.conversations.runSkillTrial(bot, identity, skill, msg.messageId)
+          return true
+        }
+        if (sub === "show" || sub === "view") {
+          await bot.sendCard(
+            identity.chatId,
+            markdownCard(`🧩 ${skill.name}`, `${describeSkill(skill)}\n\n**执行步骤与要求**\n${skill.steps}${skill.output ? `\n\n**输出要求**\n${skill.output}` : ""}`),
+            { replyTo: msg.messageId },
+          )
+          return true
+        }
+        if (sub === "del" || sub === "delete" || sub === "remove" || sub === "rm") {
+          if (skill.scope === "shared" && !isAdmin) {
+            await bot.sendText(identity.chatId, "共享技能只有管理员能删。", { replyTo: msg.messageId })
+            return true
+          }
+          await bot.sendCard(identity.chatId, skillDeleteConfirmCard(skill), { replyTo: msg.messageId })
+          return true
+        }
+        if (sub === "share") {
+          if (!isAdmin) {
+            await bot.sendText(identity.chatId, "共享给全员只有管理员可以操作。", { replyTo: msg.messageId })
+            return true
+          }
+          try {
+            const shared = store.save(
+              identity.senderId,
+              {
+                id: skill.id,
+                name: skill.name,
+                triggers: skill.triggers,
+                scene: skill.scene,
+                steps: skill.steps,
+                output: skill.output,
+                scope: "shared",
+              },
+              { allowShared: true, ownerName: identity.senderName },
+            )
+            await bot.sendCard(identity.chatId, skillSavedCard(shared, isAdmin), { replyTo: msg.messageId })
+          } catch (error) {
+            await bot.sendText(identity.chatId, error instanceof Error ? error.message : String(error), {
+              replyTo: msg.messageId,
+            })
+          }
+          return true
+        }
+        await bot.sendText(identity.chatId, "用法：/skill new | list | show <名称> | use <名称> | del <名称>", {
+          replyTo: msg.messageId,
+        })
         return true
       }
       case "stop": {

@@ -1,9 +1,10 @@
 import type { FormField, FormInfo, PermissionRequest } from "../opencode/types.js"
 import type { CronJobInfo } from "../core/commands.js"
+import { describeSkill, type Skill, type SkillScope } from "../skills/store.js"
 
 /** A stable marker used to route card callbacks back to the bridge. */
 export interface CardValue {
-  k: "perm" | "form" | "menu" | "cancel" | "gap" | "cron-sub" | "cron-mail-sub" | "cron-cancel" | "cron-del" | "cron-del-yes" | "cron-pause" | "cron-edit" | "cron-mgr" | "cron-urgent" | "make-form" | "make-sub" | "make-refresh" | "make-addfile" | "make-cancel"
+  k: "perm" | "form" | "menu" | "cancel" | "gap" | "cron-sub" | "cron-mail-sub" | "cron-cancel" | "cron-del" | "cron-del-yes" | "cron-pause" | "cron-edit" | "cron-mgr" | "cron-urgent" | "make-form" | "make-sub" | "make-refresh" | "make-addfile" | "make-cancel" | "skill-mgr" | "skill-new" | "skill-edit" | "skill-del" | "skill-del-yes" | "skill-save" | "skill-cancel" | "skill-use"
   s?: string
   r?: string
   d?: string
@@ -330,7 +331,7 @@ export function welcomeCard(sharedTemplates: string[], personalTemplates: string
     { tag: "hr" },
     {
       tag: "markdown",
-      content: `**模板库**\n${templateLine}\n\n**小提示**：直接说出任务即可，例如「用移动内部汇报模板做一份 XX 产品商业计划书 PPT」；点击下方菜单「帮助」查看使用说明。`,
+      content: `**模板库**\n${templateLine}\n\n**我的技能**\n把你的做法攒成技能：说「技能」打开管理卡片，点「新建技能」填触发词与步骤，以后提到触发词就自动照做。\n\n**小提示**：直接说出任务即可，例如「用移动内部汇报模板做一份 XX 产品商业计划书 PPT」；点击下方菜单「帮助」查看使用说明。`,
     },
   ])
 }
@@ -720,6 +721,210 @@ export function cronDeleteConfirmCard(name: string): object {
   ])
 }
 
+// ---- 个性化技能 ------------------------------------------------------------
+
+/** 技能表单的预填值（编辑时带 id）。 */
+export interface SkillFormDraft {
+  id?: string
+  name?: string
+  triggers?: string[]
+  scene?: string
+  steps?: string
+  output?: string
+  scope?: SkillScope
+}
+
+const SKILL_HINT =
+  "<font color='grey'>技能只对你生效：聊天里出现触发词时自动套用，也可以随时发「技能」打开这张卡管理。</font>"
+
+function skillRow(skill: Skill): object[] {
+  return [
+    { tag: "markdown", content: describeSkill(skill) },
+    buttonRow([
+      callbackButton("✏️ 编辑", { k: "skill-edit", d: skill.id }),
+      callbackButton("🗑 删除", { k: "skill-del", d: skill.id }, "danger"),
+      callbackButton("▶ 试用", { k: "skill-use", d: skill.id }, "primary"),
+    ]),
+  ]
+}
+
+/** 技能管理卡：个人 + 共享分组，逐条可编辑/删除/试用。 */
+export function skillManageCard(skills: Skill[], isAdmin: boolean): object {
+  const personal = skills.filter((skill) => skill.scope === "personal")
+  const shared = skills.filter((skill) => skill.scope === "shared")
+  const elements: object[] = [
+    {
+      tag: "markdown",
+      content:
+        "把你的做法写成一条**技能**：说清什么时候用、怎么做、要什么结果。以后在聊天里提到触发词，我就按它来做。",
+    },
+    { tag: "hr" },
+  ]
+
+  if (personal.length === 0 && shared.length === 0) {
+    elements.push({
+      tag: "markdown",
+      content: "还没有技能。点下面的「新建技能」，一两分钟就能攒出第一条。",
+    })
+  }
+
+  if (personal.length > 0) {
+    elements.push({ tag: "markdown", content: `**我的技能（${personal.length}）**` })
+    for (const skill of personal) elements.push(...skillRow(skill))
+    elements.push({ tag: "hr" })
+  }
+
+  if (shared.length > 0) {
+    elements.push({ tag: "markdown", content: `**共享技能（${shared.length}）**` })
+    for (const skill of shared) elements.push(...skillRow(skill))
+    elements.push({ tag: "hr" })
+  }
+
+  elements.push(
+    buttonRow([
+      callbackButton("➕ 新建技能", { k: "skill-new" }, "primary"),
+      callbackButton("🔄 刷新", { k: "skill-mgr" }),
+    ]),
+  )
+  elements.push({
+    tag: "markdown",
+    content: isAdmin
+      ? `${SKILL_HINT}\n<font color='grey'>你是管理员：新建时可以把技能设为「共享」，全员的会话都能用。</font>`
+      : SKILL_HINT,
+    text_size: "notation",
+  })
+  return baseCard("🧩 我的技能", "blue", elements)
+}
+
+const SCOPE_OPTIONS = (isAdmin: boolean): object[] =>
+  isAdmin
+    ? [selectOption("仅自己可用", "personal"), selectOption("共享给全员（管理员）", "shared")]
+    : [selectOption("仅自己可用", "personal")]
+
+/** 技能表单卡：新建 / 编辑共用。 */
+export function skillFormCard(draft: SkillFormDraft = {}, options: { isAdmin: boolean } = { isAdmin: false }): object {
+  const elements: object[] = [
+    {
+      tag: "markdown",
+      content: draft.id
+        ? "改完点「保存」，下一条消息起按新版本执行。"
+        : "**触发词**决定什么时候自动套用；**执行步骤**写得越像操作手册，效果越稳。",
+    },
+  ]
+
+  elements.push({ tag: "markdown", content: "**技能名称**\n例：竞品周报、客户拜访纪要、周会材料" })
+  elements.push({
+    tag: "input",
+    name: "name",
+    width: "fill",
+    max_length: 24,
+    default_value: draft.name,
+    placeholder: { tag: "plain_text", content: "一句话叫得出名字，2–24 字" },
+  })
+
+  elements.push({
+    tag: "markdown",
+    content: "**触发词**\n我听到这些词就套用这条技能，空格或逗号分隔，最多 8 个",
+  })
+  elements.push({
+    tag: "input",
+    name: "triggers",
+    width: "fill",
+    max_length: 200,
+    default_value: (draft.triggers ?? []).join(" "),
+    placeholder: { tag: "plain_text", content: "如：竞品周报 竞品每周 对手动态汇总" },
+  })
+
+  elements.push({ tag: "markdown", content: "**适用场景**（可选）\n这条技能是给哪类活儿用的" })
+  elements.push({
+    tag: "input",
+    name: "scene",
+    width: "fill",
+    max_length: 200,
+    default_value: draft.scene,
+    placeholder: { tag: "plain_text", content: "如：每周给部门领导看的竞品动态汇总" },
+  })
+
+  elements.push({
+    tag: "markdown",
+    content: "**执行步骤与要求**\n按你希望的做法写：先查什么、怎么对比、忌讳什么",
+  })
+  elements.push({
+    tag: "input",
+    name: "steps",
+    width: "fill",
+    input_type: "multiline_text",
+    rows: 6,
+    // 飞书对 input.max_length 的上限是 1000，写大了整张卡片会被拒（230099 / 11310）。
+    max_length: 1000,
+    default_value: draft.steps,
+    placeholder: {
+      tag: "plain_text",
+      content:
+        "如：1. 只取最近 7 天的动态，来源优先官网和行业媒体；2. 按「产品/价格/渠道」三段对比我们和对手；3. 结论不超过 5 条，每条一句话；4. 不确定的信息标注「待核实」，不要编数字。",
+    },
+  })
+
+  elements.push({ tag: "markdown", content: "**输出要求**（可选）\n格式、篇幅、语气" })
+  elements.push({
+    tag: "input",
+    name: "output",
+    width: "fill",
+    max_length: 300,
+    default_value: draft.output,
+    placeholder: { tag: "plain_text", content: "如：Markdown 表格 + 3 条结论，500 字以内，给领导看" },
+  })
+
+  if (options.isAdmin) {
+    elements.push({ tag: "markdown", content: "**谁能用**" })
+    elements.push(selectStatic("scope", "选择可见范围", SCOPE_OPTIONS(true), draft.scope ?? "personal"))
+  }
+
+  const nonce = nextFormNonce()
+  elements.push({ tag: "hr" })
+  elements.push(
+    buttonRow([
+      formSubmitButton("✅ 保存技能", { n: nonce, k: "skill-save", d: draft.id }, "primary", "submit"),
+      formSubmitButton("取消", { n: nonce, k: "skill-cancel" }, "default", "cancel"),
+    ]),
+  )
+  return baseCard(draft.id ? "✏️ 编辑技能" : "🧩 新建技能", "blue", [{ tag: "form", name: "skill_form", elements }])
+}
+
+/** 保存成功卡：直接给「试用」，省得用户再想怎么触发。 */
+export function skillSavedCard(skill: Skill, isAdmin: boolean): object {
+  const nonce = nextFormNonce()
+  const elements: object[] = [
+    { tag: "markdown", content: describeSkill(skill) },
+    {
+      tag: "markdown",
+      content:
+        skill.scope === "shared"
+          ? "全员都可以用这条技能了。想验证效果，点「试用」我立刻按它跑一次。"
+          : "以后聊天里出现这些触发词，我就会按它来做。想验证效果，点「试用」我立刻按它跑一次。",
+    },
+    buttonRow([
+      callbackButton("▶ 试用", { n: nonce, k: "skill-use", d: skill.id }, "primary"),
+      callbackButton("➕ 再建一条", { n: nonce, k: "skill-new" }),
+      callbackButton("📋 技能列表", { n: nonce, k: "skill-mgr" }),
+    ]),
+  ]
+  if (!isAdmin) elements.push({ tag: "markdown", content: SKILL_HINT, text_size: "notation" })
+  return baseCard("✅ 技能已保存", "green", elements)
+}
+
+/** 删除二次确认。 */
+export function skillDeleteConfirmCard(skill: Skill): object {
+  const nonce = nextFormNonce()
+  return baseCard("🗑 删除技能", "red", [
+    { tag: "markdown", content: `确认删除技能 **${escapeMarkdown(skill.name)}**？删除后不可恢复。` },
+    buttonRow([
+      callbackButton("✅ 确认删除", { n: nonce, k: "skill-del-yes", d: skill.id }, "danger"),
+      callbackButton("↩ 返回列表", { n: nonce, k: "skill-mgr" }),
+    ]),
+  ])
+}
+
 export function helpCard(): object {
   const commands = [
     "**新建对话** — 点击下方菜单，开启一个全新会话",
@@ -728,6 +933,7 @@ export function helpCard(): object {
     "**邮件订阅** — 点击菜单「订阅 > 邮件订阅」，选择频率和时间即可：按时整理收件箱推送日报，着重列出需要尽快回复的邮件和截止日期临近的事项；重要邮件实时推送\n  首次使用先发「绑定邮箱」：自动绑定你飞书账号登记的邮箱（只能绑自己的，填别人的地址会被拒绝）",
     "**我的订阅** — 点击菜单「订阅 > 我的订阅」弹出管理卡片：查看全部订阅，可暂停 / 恢复 / 编辑 / 删除",
     "**模板库** — 发送「模板库」查看 PPT 模板（发 .pptx 并写「存为模板 名字」可新增）",
+    "**我的技能** — 发「技能」打开管理卡片：卡片里填名称、触发词、执行步骤与输出要求，保存即生效\n  以后聊天里出现触发词就会自动按这条技能执行；也可用「用XX技能」显式指定",
     "**帮助** — 点击下方菜单，显示本帮助",
   ]
   return baseCard("🤖 产品中心智能助手", "blue", [
