@@ -69,6 +69,7 @@ export class App {
         this.conversations.completeGapFill(bot, token, answers, messageId),
       // Resolved lazily: the cron manager is constructed a few lines below.
       getCron: () => this.cron,
+      getMailBinding: () => this.mailBinding,
     })
 
     this.cron = new CronManager({
@@ -110,6 +111,7 @@ export class App {
     this.conversations.commandHandler.setFormAnswerHandler(this.interactions)
     this.conversations.commandHandler.setCronController(this.cron)
     this.conversations.commandHandler.setMailBindingStore(this.mailBinding)
+    this.conversations.setMailBinding(this.mailBinding)
     this.conversations.setInteractionProbe((sessionID) => this.interactions.hasPending(sessionID))
 
     for (const botConfig of config.bots) {

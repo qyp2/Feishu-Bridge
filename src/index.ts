@@ -6,6 +6,7 @@ import { loadConfig } from "./config/index.js"
 import { App } from "./app.js"
 import { OpencodeService } from "./opencode/service.js"
 import { Logger } from "./util/logger.js"
+import { acquireProcessLock } from "./util/lock.js"
 import { ensureDir } from "./util/paths.js"
 
 function printUsage(): void {
@@ -100,6 +101,7 @@ async function main(): Promise<void> {
   }
 
   const loaded = loadConfig(config)
+  acquireProcessLock(loaded.config.storageDir)
   const app = new App(loaded)
   await app.start()
 

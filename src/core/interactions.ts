@@ -2,11 +2,13 @@ import type { CardActionEvent } from "@larksuiteoapi/node-sdk"
 import type { OpencodeClient } from "../opencode/client.js"
 import type { FormField, FormInfo, FormValue, PermissionRequest } from "../opencode/types.js"
 import type { AuditLog, Logger } from "../util/logger.js"
-import type { FeishuBot } from "../feishu/bot.js"
+import { bindCardOwner, mentionsFor, type FeishuBot } from "../feishu/bot.js"
 import type { ChatIdentity, ConversationService, SessionContext } from "./conversations.js"
-import { buildMailDigestPrompt, type CronController } from "./commands.js"
-import { cronDeleteConfirmCard, cronFormCancelCard, cronManageCard, formCard, isMailJob, mailSubscribeCard, makeFormCard, makeSubmittedCard, permissionCard, statusCard, subscribeCard, type CardValue } from "../feishu/cards.js"
+import { buildMailDigestPrompt, lookupUserEmail, type CronController, type CronJobInfo } from "./commands.js"
+import { cronDeleteConfirmCard, cronFormCancelCard, cronManageCard, formCard, isMailJob, loginCard, loginDoneCard, mailJobName, mailSubscribeCard, makeFormCard, makeSubmittedCard, permissionCard, statusCard, studioCard, studioPendingCard, studioResultCard, subscribeCard, type CardValue, type StudioDraft, type StudioKind } from "../feishu/cards.js"
+import { CONFIG_CHANGE_DENIED, isProtectedConfigTarget } from "./configGuard.js"
 import { KeyedSerial } from "../util/async.js"
+import type { MailBindingStore } from "../mail/binding.js"
 
 /** 订阅表单的频率 option value 映射到 cron 的日/周字段 */
 const FREQ_TABLE: Record<string, { dom: string; dow: string }> = {
@@ -62,6 +64,7 @@ export interface InteractionDeps {
   ) => Promise<void>
   /** Lazily resolve the cron controller (it is constructed after this service). */
   getCron?: () => CronController | undefined
+  getMailBinding?: () => MailBindingStore | undefined
 }
 
 /**
@@ -76,6 +79,7 @@ export class InteractionService {
   private readonly pendingForms = new Map<string, PendingForm>()
   private readonly sessionsWithPermission = new Set<string>()
   private readonly actionSerial = new KeyedSerial()
+  private readonly smsSentAt = new Map<string, number>()
   private timer?: NodeJS.Timeout
   private polling = false
 
@@ -163,8 +167,29 @@ export class InteractionService {
       action: request.action,
       resources: request.resources,
     })
+    if (request.resources.some((resource) => isProtectedConfigTarget(resource))) {
+      const client = await this.deps.getClient()
+      await client.replyPermission(request.sessionID, request.id, "reject").catch(() => {})
+      this.deps.audit.record("config.change.denied", {
+        sessionID: request.sessionID,
+        action: request.action,
+        resources: request.resources,
+      })
+      if (context.chatType === "group") {
+        await bot
+          .sendText(context.chatId, CONFIG_CHANGE_DENIED, {
+            replyTo: context.replyTo,
+            mentions: mentionsFor("group", context.userOpenId),
+          })
+          .catch(() => {})
+      }
+      return
+    }
     try {
-      await bot.sendCard(context.chatId, permissionCard(request), { replyTo: context.replyTo })
+      await bot.sendCard(context.chatId, permissionCard(request), {
+        replyTo: context.replyTo,
+        mentions: mentionsFor(context.chatType ?? "p2p", context.userOpenId),
+      })
     } catch (error) {
       this.deps.logger.warn("Failed to send permission card", { error: message(error) })
     }
@@ -176,13 +201,19 @@ export class InteractionService {
     this.deps.audit.record("form.requested", { sessionID: form.sessionID, formID: form.id, title: form.title })
     const card = formCard(form, {})
     try {
-      const result = await bot.sendCardResilient(context.chatId, card, { replyTo: context.replyTo })
+      const result = await bot.sendCardResilient(context.chatId, card, {
+        replyTo: context.replyTo,
+        mentions: mentionsFor(context.chatType ?? "p2p", context.userOpenId),
+      })
       pending.messageId = result.messageId
     } catch (error) {
       this.deps.logger.warn("Failed to send form card", { error: message(error) })
       // Fall back to a text prompt so the question is still answerable.
       try {
-        await bot.sendMarkdownResilient(context.chatId, renderFormAsText(form), { replyTo: context.replyTo })
+        await bot.sendMarkdownResilient(context.chatId, renderFormAsText(form), {
+          replyTo: context.replyTo,
+          mentions: mentionsFor(context.chatType ?? "p2p", context.userOpenId),
+        })
       } catch (fallbackError) {
         this.deps.logger.warn("Failed to send form text fallback", { error: message(fallbackError) })
       }
@@ -195,11 +226,25 @@ export class InteractionService {
     const value = event.action.value as CardValue | undefined
     if (!value || typeof value !== "object" || !("k" in value)) return
     // Acknowledge Feishu immediately. The SDK only sends the card-callback
-    // response after this method resolves, and Feishu times out at ~3s ??    // replying to OpenCode and patching the card can exceed that. Do the work
-    // off the critical path, serialized per card so rapid clicks don't race.
+    // response after this method resolves, and Feishu times out at about 3s.
+    // Replying to OpenCode and patching the card can exceed that, so the work
+    // runs off the critical path, serialized per card so rapid clicks don't race.
     const key = `${event.messageId}:${value.k}:${value.f ?? value.r ?? value.d ?? ""}`
     void this.actionSerial
-      .run(key, () => this.processCardAction(bot, event, value))
+      .run(key, async () => {
+        if (value.o && event.operator.openId !== value.o) {
+          this.deps.audit.record("card.denied", {
+            bot: bot.name,
+            chatId: event.chatId,
+            operator: event.operator.openId,
+            owner: value.o,
+            kind: value.k,
+          })
+          await bot.notifyCardDenied(event.chatId, event.messageId, event.operator.openId, event.operator.name)
+          return
+        }
+        await bindCardOwner(value.o, () => this.processCardAction(bot, event, value))
+      })
       .catch((error) => this.deps.logger.warn("Card action failed", { error: message(error) }))
   }
 
@@ -245,7 +290,92 @@ export class InteractionService {
       await this.resolveMakeAddFile(bot, event, value.f, value.n)
     } else if (value.k === "make-cancel") {
       await this.resolveMakeCancel(bot, event, value.n)
+    } else if (value.k === "studio") {
+      await this.resolveStudio(bot, event, value)
+    } else if (value.k === "login") {
+      await this.resolveLogin(bot, event, value)
     }
+  }
+
+  /** 验证码登录预览：校验格式并改卡片。同一飞书账号 60 秒内只能点一次获取验证码。 */
+  private async resolveLogin(bot: FeishuBot, event: CardActionEvent, value: CardValue): Promise<void> {
+    const form = extractFormValues(event)
+    const phone = textOf(form.phone).replace(/\s+/g, "")
+    const code = textOf(form.code).trim()
+    const draft = { phone, code }
+    if (value.d === "sms") {
+      if (!/^1\d{10}$/.test(phone)) {
+        await bot.updateCard(event.messageId, loginCard({ ...draft, notice: "请输入 11 位手机号。" }))
+        return
+      }
+      const last = this.smsSentAt.get(event.operator.openId) ?? 0
+      const wait = 60_000 - (Date.now() - last)
+      if (wait > 0) {
+        await bot.updateCard(event.messageId, loginCard({ ...draft, sent: true, notice: `请 ${Math.ceil(wait / 1000)} 秒后再获取验证码。` }))
+        return
+      }
+      this.smsSentAt.set(event.operator.openId, Date.now())
+      await bot.updateCard(event.messageId, loginCard({ ...draft, sent: true, notice: "验证码已发送。预览不会真的发短信，任意 6 位数字都可以登录。" }))
+      return
+    }
+    if (!/^1\d{10}$/.test(phone)) {
+      await bot.updateCard(event.messageId, loginCard({ ...draft, notice: "请输入 11 位手机号。" }))
+      return
+    }
+    if (!/^\d{6}$/.test(code)) {
+      await bot.updateCard(event.messageId, loginCard({ ...draft, notice: "请输入 6 位验证码。" }))
+      return
+    }
+    await bot.updateCard(event.messageId, loginDoneCard(phone))
+  }
+
+  /** 创作工作台预览：切换功能、回填已填内容，开始生成只改这张卡片。 */
+  private async resolveStudio(bot: FeishuBot, event: CardActionEvent, value: CardValue): Promise<void> {
+    const saved = studioDraftFrom(value)
+    const form = extractFormValues(event)
+    const prompt = textOf(form.prompt) || saved.prompt || ""
+    const product = textOf(form.product) || saved.product || ""
+    const channel = textOf(form.channel) || saved.channel || "淘宝/天猫"
+    const language = textOf(form.language) || saved.language || "繁体中文"
+    const words = textOf(form.words) || saved.words || "200"
+    const scene = textOf(form.scene) || saved.scene || ""
+    const selling = textOf(form.selling) || saved.selling || ""
+    const platform = textOf(form.platform) || saved.platform || "Twitter"
+    const tone = textOf(form.tone) || saved.tone || "广东粤语"
+    const picked = value.d === "copy" || value.d === "poster" || value.d === "commerce" ? value.d : undefined
+    const kind: StudioKind = picked ?? (value.f === "poster" || value.f === "commerce" || value.f === "copy" ? value.f : "copy")
+    const filled = { kind, prompt, product, channel, language, words, scene, selling, platform, tone }
+    if (value.d === "revise") {
+      await bot.updateCard(event.messageId, studioCard({ ...filled, kind: "copy" }))
+      return
+    }
+    if (picked || value.d === "back") {
+      await bot.updateCard(event.messageId, studioCard(filled))
+      return
+    }
+    if (kind === "commerce" && !product.trim()) {
+      await bot.updateCard(event.messageId, studioCard({ ...filled, notice: "请先填写产品名称。" }))
+      return
+    }
+    if (kind === "copy" && !scene.trim()) {
+      await bot.updateCard(event.messageId, studioCard({ ...filled, notice: "请先填写场景需求。" }))
+      return
+    }
+    if (kind === "copy" && !product.trim()) {
+      await bot.updateCard(event.messageId, studioCard({ ...filled, notice: "请先填写产品名称。" }))
+      return
+    }
+    if (kind === "copy" && !/^\d+$/.test(words.trim())) {
+      await bot.updateCard(event.messageId, studioCard({ ...filled, notice: "输出字数请填数字，例如 200。" }))
+      return
+    }
+    if (kind === "poster" && !prompt.trim()) {
+      await bot.updateCard(event.messageId, studioCard({ ...filled, notice: "请先填写描述。" }))
+      return
+    }
+    await bot.updateCard(event.messageId, studioPendingCard())
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    await bot.updateCard(event.messageId, studioResultCard(filled))
   }
 
   /** 「取消」:主动作废这张表单卡——编号消费,此后卡上所有按钮都不再可用。 */
@@ -387,12 +517,15 @@ export class InteractionService {
       await bot.sendText(event.chatId, "定时任务未启用。")
       return
     }
-    await bot.updateCard(event.messageId, cronManageCard(cron.list()))
+    await bot.updateCard(event.messageId, cronManageCard(cron.listFor(event.operator.openId, event.chatId)))
   }
 
   private async resolveCronToggle(bot: FeishuBot, event: CardActionEvent, name: string): Promise<void> {
     const cron = this.deps.getCron?.()
-    if (!cron) return
+    if (!cron || !this.ownJob(cron, event, name)) {
+      await bot.sendText(event.chatId, `未找到订阅「${name}」`)
+      return
+    }
     const enabled = cron.togglePause(name)
     if (enabled === undefined) {
       await bot.sendText(event.chatId, `未找到订阅「${name}」`)
@@ -404,7 +537,10 @@ export class InteractionService {
 
   private async resolveCronUrgent(bot: FeishuBot, event: CardActionEvent, name: string): Promise<void> {
     const cron = this.deps.getCron?.()
-    if (!cron) return
+    if (!cron || !this.ownJob(cron, event, name)) {
+      await bot.sendText(event.chatId, `未找到订阅「${name}」`)
+      return
+    }
     const urgent = cron.toggleUrgent(name)
     if (urgent === undefined) {
       await bot.sendText(event.chatId, `未找到订阅「${name}」`)
@@ -415,7 +551,12 @@ export class InteractionService {
 
   private async resolveCronRemove(bot: FeishuBot, event: CardActionEvent, name: string): Promise<void> {
     const cron = this.deps.getCron?.()
-    if (!cron) return
+    const job = cron ? this.ownJob(cron, event, name) : undefined
+    if (!cron || !job) {
+      await bot.sendText(event.chatId, `未找到订阅「${name}」`)
+      return
+    }
+    if (isMailJob(job)) this.deps.getMailBinding?.()?.clearDelivery(event.operator.openId)
     await cron.remove(name)
     await this.refreshCronManage(bot, event)
   }
@@ -424,7 +565,7 @@ export class InteractionService {
   private async resolveCronEdit(bot: FeishuBot, event: CardActionEvent, name: string): Promise<void> {
     const cron = this.deps.getCron?.()
     if (!cron) return
-    const job = cron.list().find((j) => j.name === name)
+    const job = this.ownJob(cron, event, name)
     if (!job) {
       await bot.sendText(event.chatId, `未找到订阅「${name}」`)
       return
@@ -437,14 +578,18 @@ export class InteractionService {
     await bot.updateCard(event.messageId, subscribeCard(job))
   }
 
+  private ownJob(cron: CronController, event: CardActionEvent, name: string): CronJobInfo | undefined {
+    return cron.listFor(event.operator.openId, event.chatId).find((job) => job.name === name)
+  }
+
   /**
-   * 邮件订阅表单提交：表单只有频率和时间，日报逻辑固定（buildMailDigestPrompt），
-   * 总结范围随频率（FREQ_DAYS）。名称固定「邮件管理」——一个邮箱一份管理订阅，
-   * 重复创建同名即覆盖。value.f 带旧名时为编辑（同名替换）。
+   * 邮件订阅按飞书用户隔离。第一次提交必须带上自己的邮箱；编辑已有订阅只改频率和时间，
+   * 沿用已经绑定的邮箱。任务名按用户区分，避免后订阅的人覆盖别人的任务。
    */
   private async resolveMailSubscribe(bot: FeishuBot, event: CardActionEvent, value: CardValue): Promise<void> {
     const cron = this.deps.getCron?.()
-    if (!cron) {
+    const store = this.deps.getMailBinding?.()
+    if (!cron || !store) {
       await bot.sendText(event.chatId, "定时任务未启用。")
       return
     }
@@ -453,38 +598,68 @@ export class InteractionService {
     const freq = FREQ_TABLE[freqKey]
     const hour = Number(values.hour)
     const minute = Number(values.minute)
+    const editing = value.f ? this.ownJob(cron, event, value.f) : undefined
+    const reopen = (notice: string) => bot.updateCard(event.messageId, mailSubscribeCard(editing ? { name: editing.name, schedule: editing.schedule } : undefined, notice))
     if (!freq || !Number.isInteger(hour) || hour < 0 || hour > 23 || !Number.isInteger(minute) || minute < 0 || minute > 59) {
-      await bot.updateCard(
-        event.messageId,
-        statusCard(
-          "⚠️ 邮件订阅未提交",
-          "表单信息不完整：请选择总结频率、小时和分钟。\n从菜单「订阅 > 邮件订阅」可重新打开表单。",
-          "orange",
-        ),
-      )
+      await reopen("请选择总结频率、小时和分钟。")
       return
     }
-    const name = value.f ?? "邮件管理"
-    const days = FREQ_DAYS[freqKey] ?? 1
+    const openId = event.operator.openId
+    let email = store.get(openId)?.email ?? ""
+    if (!editing) {
+      email = textOf(values.email).trim()
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        await reopen("请填写你的飞书邮箱。")
+        return
+      }
+      const actual = await lookupUserEmail(bot, openId).catch(() => "")
+      if (!actual) {
+        await reopen("没能从飞书通讯录查到你的企业邮箱，请联系管理员核对后再订阅。")
+        return
+      }
+      if (email.toLowerCase() !== actual.toLowerCase()) {
+        await reopen(`只能填写你飞书账号登记的邮箱：${actual}`)
+        return
+      }
+      if (store.takenByOther(actual, openId)) {
+        await reopen("这个邮箱已经绑定在另一个飞书账号上。")
+        return
+      }
+      email = actual
+      store.set(openId, email, { chatId: event.chatId, bot: bot.name })
+    } else if (!email) {
+      await bot.updateCard(event.messageId, mailSubscribeCard(undefined, "还没有绑定邮箱，请重新填写。"))
+      return
+    } else {
+      store.touchDelivery(openId, event.chatId, bot.name)
+    }
+    const saved = store.get(openId)
+    if (!saved) {
+      await reopen("还没有绑定邮箱，请重新填写。")
+      return
+    }
     const chat = await bot.getChatInfo(event.chatId).catch(() => undefined)
-    const chatType = String((chat as { chatType?: string } | undefined)?.chatType ?? "p2p")
+    const chatType = String((chat as { chatType?: string } | undefined)?.chatType ?? "p2p") === "group" ? "group" : "p2p"
+    this.deps.conversations.plantMailScope(bot, event.chatId, openId, chatType)
+    const name = editing?.name ?? cron.listFor(openId, event.chatId).find((job) => isMailJob(job))?.name ?? mailJobName(openId)
+    const days = FREQ_DAYS[freqKey] ?? 1
     const identity: ChatIdentity = {
       chatId: event.chatId,
-      chatType: chatType === "group" ? "group" : "p2p",
-      senderId: event.operator.openId,
+      chatType,
+      senderId: openId,
       senderName: event.operator.name ?? "user",
     }
     const result = await cron.add(
-      [name, String(minute), String(hour), freq.dom, "*", freq.dow, buildMailDigestPrompt(days)],
+      [name, String(minute), String(hour), freq.dom, "*", freq.dow, buildMailDigestPrompt(days, saved.email)],
       identity,
       bot.name,
     )
-    this.deps.audit.record("cron.subscribe_card", { bot: bot.name, chatId: event.chatId, name, operator: event.operator.openId, edit: value.f, kind: "mail" })
+    this.deps.audit.record("cron.subscribe_card", { bot: bot.name, chatId: event.chatId, name, operator: openId, edit: editing?.name, kind: "mail" })
     await bot.updateCard(
       event.messageId,
       statusCard(
         "📮 邮件管理已开启",
-        `${result}\n每次总结过去 **${days} 天**的收件箱，着重列出需要尽快回复的邮件、未来两周内有截止日期的事项（提前 15 分钟静默预生成，响铃加急）；重要性「高」的新邮件实时单独推送。`,
+        `${result}\n邮箱：**${saved.email}**\n每次总结过去 **${days} 天**的收件箱，只读这个邮箱。重要性「高」的新邮件实时单独推送。`,
         "green",
       ),
     )
@@ -537,7 +712,7 @@ export class InteractionService {
     await bot.updateCard(event.messageId, statusCard("⏰ 订阅结果", result + suffix, "green"))
   }
 
-  /** Text the user typed into a system gap-fill card. This is not an agent question. */
+  /** An old gap-fill card. New turns no longer send one; missing text is a chat reply. */
   private async resolveGapFill(bot: FeishuBot, event: CardActionEvent, token: string): Promise<void> {
     const answers: Record<string, string> = {}
     for (const [key, raw] of Object.entries(extractFormValues(event))) {
@@ -555,6 +730,9 @@ export class InteractionService {
     decision: "once" | "always" | "reject",
   ): Promise<void> {
     const client = await this.deps.getClient()
+    const pending = await client.pendingPermissions(sessionID).catch(() => [])
+    const request = pending.find((item) => item.id === requestID)
+    if (request?.resources.some((resource) => isProtectedConfigTarget(resource))) decision = "reject"
     await client.replyPermission(sessionID, requestID, decision)
     this.handledPermissions.add(requestID)
     const label = decision === "once" ? "仅本次允许" : decision === "always" ? "始终允许" : "已拒绝"
@@ -606,7 +784,7 @@ export class InteractionService {
   }
 
   /** Handle `/answer <formId?> key=value ...` from a chat. */
-  async answer(sessionID: string, args: string): Promise<string> {
+  async answer(sessionID: string, args: string, operatorOpenId?: string): Promise<string> {
     const pending = [...this.pendingForms.values()].find((p) => p.form.sessionID === sessionID)
     if (!pending) return "当前没有待回答的问题。"
     const tokens = args.trim().split(/\s+/).filter(Boolean)
@@ -615,6 +793,10 @@ export class InteractionService {
     if (first && this.pendingForms.has(first)) {
       target = this.pendingForms.get(first) as PendingForm
       tokens.shift()
+    }
+    const owner = target.context.userOpenId
+    if (owner && operatorOpenId && owner !== operatorOpenId) {
+      return "这张提问只有发起人可以回答。需要自己用时，请 @ 机器人重新发起。"
     }
     return this.applyAnswers(target, tokens)
   }
@@ -757,6 +939,28 @@ function renderFormAsText(form: FormInfo): string {
         : `${sample.key}=你的答案`
   lines.push(`\n请回复:\`/answer ${hint}\`(多个字段用空格分隔)`)
   return lines.join("\n")
+}
+
+function textOf(value: unknown): string {
+  return typeof value === "string" ? value : ""
+}
+
+function studioDraftFrom(value: CardValue): StudioDraft {
+  const raw = value.v
+  const saved = raw && typeof raw === "object" ? (raw as { prompt?: unknown; product?: unknown; channel?: unknown; language?: unknown; words?: unknown; scene?: unknown; selling?: unknown; platform?: unknown; tone?: unknown }) : {}
+  const kind: StudioKind = value.f === "poster" || value.f === "commerce" || value.f === "copy" ? value.f : "copy"
+  return {
+    kind,
+    prompt: textOf(saved.prompt),
+    product: textOf(saved.product),
+    channel: textOf(saved.channel),
+    language: textOf(saved.language),
+    words: textOf(saved.words),
+    scene: textOf(saved.scene),
+    selling: textOf(saved.selling),
+    platform: textOf(saved.platform),
+    tone: textOf(saved.tone),
+  }
 }
 
 /**

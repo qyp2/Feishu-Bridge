@@ -305,6 +305,8 @@ export class CronManager implements CronController {
       enabled: true,
       urgent: j.config.urgent !== false,
       next: j.cron.nextRun()?.toLocaleString(),
+      chatId: j.config.chatId,
+      ownerOpenId: j.config.ownerOpenId,
     }))
     const paused = [...this.pausedJobs.values()].map((c) => ({
       name: c.name,
@@ -313,8 +315,14 @@ export class CronManager implements CronController {
       enabled: false,
       urgent: c.urgent !== false,
       next: undefined,
+      chatId: c.chatId,
+      ownerOpenId: c.ownerOpenId,
     }))
     return [...active, ...paused]
+  }
+
+  listFor(openId: string, chatId: string): CronJobInfo[] {
+    return this.list().filter((job) => job.ownerOpenId === openId || (!job.ownerOpenId && job.chatId === chatId))
   }
 
   /** Pause an active job or resume a paused one. Returns the new enabled state. */

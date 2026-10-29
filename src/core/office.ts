@@ -48,6 +48,7 @@ const MAX_RUN_CHARS = 80
  */
 export async function describeDocuments(files: PromptFileAttachment[] | undefined): Promise<string> {
   const lines: string[] = []
+  let sawWorkbook = false
   for (const file of files ?? []) {
     const filePath = file.uri.startsWith("file:") ? fileURLToPath(file.uri) : file.uri
     const name = file.name ?? path.basename(filePath)
@@ -77,16 +78,184 @@ export async function describeDocuments(files: PromptFileAttachment[] | undefine
       lines.push(`- ${name}：旧版 .ppt 无法解析。请改发 .pptx。相关内容写「未提供」。`)
       continue
     }
+    if (ext === ".xls") {
+      lines.push(`- ${name}：旧版 .xls 无法解析。请改发 .xlsx。相关内容写「未提供」。`)
+      continue
+    }
+    if (ext === ".xlsx" || ext === ".xlsm" || (await isWorkbookFile(filePath))) {
+      lines.push(await workbookLine(name, filePath))
+      sawWorkbook = true
+      continue
+    }
     lines.push(`- ${name}：${filePath}。这不是已抽取的文本。不要打开它，相关内容写「未提供」。`)
   }
   if (lines.length === 0) return ""
   return [
     "",
     "材料已预处理。业务子 Agent 只读取标为「正文」或「槽位清单」的文本，每份读一次。",
-    "业务子 Agent 不要读取 .doc、.docx、.ppt、.pptx、.pdf，不要搜索目录。",
+    "业务子 Agent 不要读取 .doc、.docx、.ppt、.pptx、.pdf、.xlsx，不要搜索目录。",
+    ...(sawWorkbook
+      ? [
+          "Excel 已抽成同路径的 .txt。个数和占比只能运行下面的计数命令，不要心算，不要通读整表，不要交给子 Agent。",
+          "禁止使用 Grep、rg 或正则数行。ripgrep 不支持前瞻，列偏移也不可猜，这样得到的个数无效。Grep 失败后不要换正则重试。",
+          `在本机运行 node "${SHEET_TOOL}" count "表格.txt的绝对路径" --where "列名::empty"。`,
+          "用户有几个并且条件，这一次命令就写几个 --where。比较写成 列名::contains::文本、列名::not-contains::文本、列名::equals::文本、列名::not-empty。",
+          "回复只用这一次输出的 matched 和 ratio。禁止把只满足其中一个条件的数字当成结果。脚本失败就报告错误，不要估算。",
+        ]
+      : []),
     "模板的 pptx 原路径只交给成稿步骤。成稿不要打开 pptx，把路径传给排版命令。命令会克隆模板的封面、目录、内容页背景和尾页。正文按槽位清单写成带标题的 Markdown。明细用表格；占比写成饼图，对比或趋势写成柱状图。",
     ...lines,
   ].join("\n")
+}
+
+const MAX_EXTRACT_CHARS = 3_000_000
+const SHEET_TOOL = "C:/AGENT_FINAL/feishu_bridge/scripts/sheet.mjs"
+
+interface ExcelCellValue {
+  value: unknown
+}
+
+interface ExcelRow {
+  eachCell(options: { includeEmpty: boolean }, visitor: (cell: ExcelCellValue, col: number) => void): void
+}
+
+interface ExcelWorksheet {
+  name: string
+  eachRow(options: { includeEmpty: boolean }, visitor: (row: ExcelRow, rowNumber: number) => void): void
+}
+
+interface ExcelWorkbook {
+  worksheets: ExcelWorksheet[]
+  xlsx: { readFile(file: string): Promise<void> }
+}
+
+/** True when the file is an xlsx/xlsm package, even if the saved name lost `.xlsx`. */
+export async function isWorkbookFile(filePath: string): Promise<boolean> {
+  if (!fs.existsSync(filePath) || !isZip(filePath)) return false
+  try {
+    const entries = await readZipEntries(filePath, (name) => name.replace(/\\/g, "/").toLowerCase() === "xl/workbook.xml")
+    return entries.size > 0
+  } catch {
+    return false
+  }
+}
+
+/** Write the workbook extract next to the file and return that txt path. */
+async function ensureWorkbookExtract(name: string, filePath: string): Promise<string> {
+  const dest = `${filePath}.txt`
+  if (!isFresh(dest, filePath)) {
+    try {
+      fs.writeFileSync(dest, await workbookText(name, filePath), "utf8")
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      fs.writeFileSync(dest, `来源：${name}\n完整度：抽取失败\n抽取失败：${reason}\n不要读取原始文件。相关内容写「未提供」。\n`, "utf8")
+    }
+  }
+  return dest
+}
+
+async function workbookLine(name: string, filePath: string): Promise<string> {
+  const dest = await ensureWorkbookExtract(name, filePath)
+  const summary = workbookSummary(dest)
+  return `- 正文 ${name}：${dest}\n  ${summary}\n  计数命令：node "${SHEET_TOOL}" count "${dest}" --where "列名::empty"`
+}
+
+function workbookSummary(dest: string): string {
+  const text = fs.readFileSync(dest, "utf8")
+  const completeness = /^完整度：(.+)$/m.exec(text)?.[1] ?? "未知"
+  const sheets = [...text.matchAll(/^# (.+)$/gm)].map((match) => match[1])
+  const rows = /^数据行数：(\d+)$/m.exec(text)?.[1]
+  const columns = /^列：(.+)$/m.exec(text)?.[1]?.replace(/\t/g, "、")
+  const parts = [`完整度 ${completeness}`]
+  if (sheets.length > 0) parts.push(`工作表 ${sheets.join("、")}`)
+  if (rows) parts.push(`数据行数 ${rows}`)
+  if (columns) parts.push(`列 ${columns}`)
+  return parts.join("；")
+}
+
+async function workbookText(name: string, filePath: string): Promise<string> {
+  const ExcelJS = require("exceljs") as { Workbook: new () => ExcelWorkbook }
+  const workbook = new ExcelJS.Workbook()
+  await workbook.xlsx.readFile(filePath)
+  const blocks: string[] = []
+  let used = 0
+  let complete = true
+  for (const sheet of workbook.worksheets) {
+    const table = renderSheet(sheet)
+    const block = [`# ${oneLine(sheet.name) || "Sheet"}`, `数据行数：${table.dataRows}`, `列：${table.headers.join("\t")}`, table.body].join("\n")
+    if (used + block.length > MAX_EXTRACT_CHARS) {
+      complete = false
+      break
+    }
+    blocks.push(block)
+    used += block.length
+  }
+  return [
+    `来源：${name}`,
+    "只读本文件，不要读取原始 Excel。第 1 行是表头。空单元格表示缺失。",
+    `完整度：${complete ? "完整" : "未完整抽出"}`,
+    ...blocks,
+    "",
+  ].join("\n")
+}
+
+function renderSheet(sheet: ExcelWorksheet): { headers: string[]; dataRows: number; body: string } {
+  const grid: Map<number, string>[] = []
+  let maxCol = 0
+  sheet.eachRow({ includeEmpty: false }, (row) => {
+    const cells = new Map<number, string>()
+    row.eachCell({ includeEmpty: false }, (cell, col) => {
+      cells.set(col, formatCell(cell.value))
+      if (col > maxCol) maxCol = col
+    })
+    if ([...cells.values()].some((value) => value.length > 0)) grid.push(cells)
+  })
+  if (grid.length === 0 || maxCol === 0) return { headers: [], dataRows: 0, body: "" }
+  const headerRow = grid[0] ?? new Map<number, string>()
+  const used = new Map<string, number>()
+  const headers: string[] = []
+  for (let col = 1; col <= maxCol; col += 1) {
+    const raw = headerRow.get(col) || `列${col}`
+    const seen = used.get(raw) ?? 0
+    used.set(raw, seen + 1)
+    headers.push(seen === 0 ? raw : `${raw} (${seen + 1})`)
+  }
+  const lines = [headers.join("\t")]
+  for (const cells of grid.slice(1)) {
+    const values: string[] = []
+    for (let col = 1; col <= maxCol; col += 1) values.push(cells.get(col) ?? "")
+    lines.push(values.join("\t"))
+  }
+  return { headers, dataRows: grid.length - 1, body: lines.join("\n") }
+}
+
+function formatCell(value: unknown): string {
+  if (value == null) return ""
+  if (value instanceof Date) return formatDate(value)
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : ""
+  if (typeof value === "boolean") return value ? "TRUE" : "FALSE"
+  if (typeof value === "string") return oneLine(value)
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>
+    if (Array.isArray(record.richText)) {
+      return oneLine(record.richText.map((part) => (part && typeof part === "object" && "text" in part ? String((part as { text?: unknown }).text ?? "") : "")).join(""))
+    }
+    if ("result" in record) return formatCell(record.result)
+    if (typeof record.text === "string") return oneLine(record.text)
+    return ""
+  }
+  return oneLine(String(value))
+}
+
+function formatDate(value: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0")
+  const date = `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`
+  if (value.getHours() === 0 && value.getMinutes() === 0 && value.getSeconds() === 0) return date
+  return `${date} ${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}`
+}
+
+function oneLine(value: string): string {
+  return value.replace(/\u0000/g, "").replace(/[\t\r\n]+/g, " ").trim()
 }
 
 function isZip(filePath: string): boolean {

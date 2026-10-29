@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks"
 import * as Lark from "@larksuiteoapi/node-sdk"
 import type {
   CardActionEvent,
@@ -119,7 +120,12 @@ export class FeishuBot {
   }
 
   async sendCard(to: string, card: object, opts?: SendOptions): Promise<SendResult> {
-    return this.channel.send(to, { card }, opts)
+    const mentioned = opts?.mentions?.map((item) => item.openId).find((id): id is string => Boolean(id))
+    const owner = mentioned ?? cardOwnerScope.getStore()
+    const mentions = opts?.mentions ?? (owner ? [{ key: owner, openId: owner }] : undefined)
+    let next = withCardMentions(card, mentions)
+    if (owner) next = stampCardOwner(next, owner)
+    return this.channel.send(to, { card: next }, opts)
   }
 
   /**
@@ -157,8 +163,46 @@ export class FeishuBot {
     return this.channel.send(to, { image: { source } }, opts)
   }
 
-  async updateCard(messageId: string, card: object): Promise<void> {
-    return this.channel.updateCard(messageId, card)
+  async updateCard(messageId: string, card: object, ownerOpenId?: string): Promise<void> {
+    const owner = ownerOpenId ?? cardOwnerScope.getStore()
+    let next = card
+    if (owner) {
+      next = withCardMentions(card, [{ key: owner, openId: owner }])
+      next = stampCardOwner(next, owner)
+    }
+    return this.channel.updateCard(messageId, next)
+  }
+
+  /**
+   * Tell the clicker, and only the clicker, that this group card is not theirs.
+   * Falls back to a group reply if the ephemeral API is unavailable.
+   */
+  async notifyCardDenied(chatId: string, messageId: string, openId: string, name?: string): Promise<void> {
+    const text = "这张卡片只有发起人可以修改、编辑和提交。你可以看到内容。需要自己用时，请 @ 机器人重新发起。"
+    try {
+      const res = await this.raw.request({
+        method: "POST",
+        url: "/open-apis/ephemeral/v1/send",
+        data: {
+          chat_id: chatId,
+          open_id: openId,
+          msg_type: "interactive",
+          card: {
+            header: { title: { tag: "plain_text", content: "无法操作" }, template: "orange" },
+            elements: [{ tag: "markdown", content: text }],
+          },
+        },
+      })
+      const code = responseCode(res)
+      if (code !== undefined && code !== 0) throw new Error(`ephemeral code ${code}`)
+      return
+    } catch (error) {
+      this.logger.warn("Private card-deny notice failed", { error: messageOf(error) })
+    }
+    await this.sendText(chatId, text, {
+      replyTo: messageId,
+      mentions: mentionsFor("group", openId, name),
+    }).catch(() => {})
   }
 
   /**
@@ -297,6 +341,101 @@ function streamToBuffer(raw: unknown): Promise<Buffer> {
   }
   if (wrapper && Buffer.isBuffer(wrapper.data)) return Promise.resolve(wrapper.data)
   throw new Error("unexpected download response type")
+}
+
+const cardOwnerScope = new AsyncLocalStorage<string>()
+
+/** Card updates inside this call keep the same owner, including after a restart. */
+export function bindCardOwner<T>(owner: string | undefined, fn: () => Promise<T>): Promise<T> {
+  if (!owner) return fn()
+  return cardOwnerScope.run(owner, fn)
+}
+
+const CARD_VIEW_NOTE = "其他人只能查看，不能修改、编辑或提交。"
+
+/** Write the owner onto every callback, and say so on interactive cards. */
+function stampCardOwner(card: object, ownerOpenId: string): object {
+  const copy = structuredClone(card) as { body?: { elements?: Array<Record<string, unknown>> } }
+  let stamped = false
+  const walk = (node: unknown): void => {
+    if (!node || typeof node !== "object") return
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item)
+      return
+    }
+    const record = node as Record<string, unknown>
+    const behaviors = record.behaviors
+    if (Array.isArray(behaviors)) {
+      for (const behavior of behaviors) {
+        if (!behavior || typeof behavior !== "object") continue
+        const value = (behavior as { value?: unknown }).value
+        if (value && typeof value === "object" && "k" in value) {
+          ;(value as { o?: string }).o = ownerOpenId
+          stamped = true
+        }
+      }
+    }
+    if (record.value && typeof record.value === "object" && "k" in (record.value as object)) {
+      ;(record.value as { o?: string }).o = ownerOpenId
+      stamped = true
+    }
+    for (const child of Object.values(record)) walk(child)
+  }
+  walk(copy)
+  if (!stamped) return card
+  const elements = copy.body?.elements
+  if (elements) {
+    const first = elements.find((element) => element.tag === "markdown" && typeof element.content === "string")
+    if (first && typeof first.content === "string") {
+      if (!first.content.includes(CARD_VIEW_NOTE)) {
+        if (first.content.startsWith("<at ")) {
+          const nl = first.content.indexOf("\n")
+          first.content =
+            nl === -1
+              ? `${first.content}\n${CARD_VIEW_NOTE}`
+              : `${first.content.slice(0, nl)}\n${CARD_VIEW_NOTE}${first.content.slice(nl)}`
+        } else {
+          first.content = `${CARD_VIEW_NOTE}\n${first.content}`
+        }
+      }
+    } else {
+      elements.unshift({ tag: "markdown", content: CARD_VIEW_NOTE })
+    }
+  }
+  return copy
+}
+
+/** Group replies name the sender. Private chats stay unmentioned. */
+export function mentionsFor(chatType: string, openId?: string, name?: string): SendOptions["mentions"] {
+  if (chatType !== "group" || !openId) return undefined
+  return [{ key: openId, openId, name }]
+}
+
+/**
+ * Card markdown does not read SendOptions.mentions. Prepend the card @ syntax
+ * so the reply still names the person who sent the instruction.
+ */
+function withCardMentions(card: object, mentions: SendOptions["mentions"]): object {
+  const openIds = (mentions ?? []).map((item) => item.openId).filter((id): id is string => Boolean(id))
+  if (openIds.length === 0) return card
+  const prefix = openIds.map((id) => `<at id=${id}></at>`).join(" ")
+  const copy = structuredClone(card) as { body?: { elements?: Array<Record<string, unknown>> } }
+  const elements = copy.body?.elements
+  if (!elements) return card
+  const first = elements.find((element) => element.tag === "markdown" && typeof element.content === "string")
+  if (first && typeof first.content === "string") {
+    if (!first.content.includes(prefix)) first.content = `${prefix}\n${first.content}`
+    return copy
+  }
+  elements.unshift({ tag: "markdown", content: prefix })
+  return copy
+}
+
+function responseCode(res: unknown): number | undefined {
+  const data = (res as { data?: { code?: number } } | undefined)?.data
+  if (data && typeof data.code === "number") return data.code
+  const direct = (res as { code?: number } | undefined)?.code
+  return typeof direct === "number" ? direct : undefined
 }
 
 function messageOf(error: unknown): string {
