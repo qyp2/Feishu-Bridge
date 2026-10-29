@@ -1,6 +1,6 @@
 import fs from "node:fs"
 import path from "node:path"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { describeDocuments } from "../core/office.js"
 import type {
   AgentInfo,
@@ -295,26 +295,20 @@ export class OpencodeClient {
   }
 }
 
-const IMAGE_MIME: Record<string, string> = {
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".gif": "image/gif",
-  ".webp": "image/webp",
-}
+const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"])
 
+/** `PromptInput.FileAttachment`：服务端只接受 uri，由它自己读文件并转成 base64。 */
 interface ApiPromptFile {
-  data: string
-  mime: string
-  source: { type: "uri"; uri: string }
+  uri: string
   name?: string
   description?: string
 }
 
 /**
- * OpenCode only accepts image attachments, and `data` must be raw base64.
- * A `file://` URI in that field fails schema validation and the prompt
- * route returns HTTP 500. Documents stay on disk; their paths go in the text.
+ * OpenCode 的 prompt 接口只收 `{ uri, name?, description? }`，文件由服务端读取
+ * （早期版本要客户端自己塞 `data`/`mime`/`source`，现在那套形状会报
+ * `Missing key at ["files"][0]["uri"]`）。只有图片作为附件发送；文档仅以
+ * `describeDocuments` 的文字说明交给模型，正文不进上下文。
  */
 function encodePromptFiles(
   text: string,
@@ -324,15 +318,9 @@ function encodePromptFiles(
   for (const file of files ?? []) {
     const filePath = file.uri.startsWith("file:") ? fileURLToPath(file.uri) : file.uri
     const ext = path.extname(file.name ?? filePath).toLowerCase()
-    const mime = IMAGE_MIME[ext]
-    if (!mime) continue
-    images.push({
-      data: fs.readFileSync(filePath).toString("base64"),
-      mime,
-      source: { type: "uri", uri: file.uri },
-      name: file.name,
-      description: file.description,
-    })
+    if (!IMAGE_EXT.has(ext)) continue
+    // 统一成 file:// URL：路径里的空格会被百分号编码，服务端才认。
+    images.push({ uri: pathToFileURL(filePath).href, name: file.name, description: file.description })
   }
   return { text, files: images.length > 0 ? images : undefined }
 }
