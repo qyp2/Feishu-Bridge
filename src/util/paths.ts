@@ -32,6 +32,22 @@ export function safeSegment(input: string): string {
   return cleaned.slice(0, 80)
 }
 
+const KNOWN_FILE_EXT = /\.(xlsx|xlsm|xls|csv|docx|doc|pptx|ppt|pdf|txt|md|json|png|jpe?g|gif|webp|zip|mp3|mp4)$/i
+
+/**
+ * Like safeSegment, but a known extension at the end of a long filename is kept.
+ * Feishu export names are longer than 80 characters and contain extra dots, so
+ * slicing the whole name drops `.xlsx` and leaves a fake extension.
+ */
+export function safeFileName(input: string): string {
+  const trimmed = input.trim()
+  const match = KNOWN_FILE_EXT.exec(trimmed)
+  const extension = match ? match[0].toLowerCase() : ""
+  const stem = safeSegment(extension ? trimmed.slice(0, -match![0].length) : trimmed)
+  const room = Math.max(1, 80 - extension.length)
+  return `${stem.slice(0, room)}${extension}`
+}
+
 export function timestamp(): string {
   return new Date().toISOString()
 }

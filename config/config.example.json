@@ -26,7 +26,7 @@
       "model": { "providerID": "myapi", "id": "deepseek-v4-free" },
       "location": "../data/workspaces",
       "project": "D:/path/to/your/opencode/project",
-      "perUserInGroup": false,
+      "perUserInGroup": true,
       "requireMention": true,
       "commands": true,
       "holdAttachmentsWithoutText": true,

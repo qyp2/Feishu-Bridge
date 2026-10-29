@@ -4,7 +4,7 @@ import { describeSkill, type Skill, type SkillScope } from "../skills/store.js"
 
 /** A stable marker used to route card callbacks back to the bridge. */
 export interface CardValue {
-  k: "perm" | "form" | "menu" | "cancel" | "gap" | "cron-sub" | "cron-mail-sub" | "cron-cancel" | "cron-del" | "cron-del-yes" | "cron-pause" | "cron-edit" | "cron-mgr" | "cron-urgent" | "make-form" | "make-sub" | "make-refresh" | "make-addfile" | "make-cancel" | "skill-mgr" | "skill-new" | "skill-edit" | "skill-del" | "skill-del-yes" | "skill-save" | "skill-cancel" | "skill-use"
+  k: "perm" | "form" | "menu" | "cancel" | "gap" | "cron-sub" | "cron-mail-sub" | "cron-cancel" | "cron-del" | "cron-del-yes" | "cron-pause" | "cron-edit" | "cron-mgr" | "cron-urgent" | "make-form" | "make-sub" | "make-refresh" | "make-addfile" | "make-cancel" | "studio" | "login" | "skill-mgr" | "skill-new" | "skill-edit" | "skill-del" | "skill-del-yes" | "skill-save" | "skill-cancel" | "skill-use"
   s?: string
   r?: string
   d?: string
@@ -13,6 +13,8 @@ export interface CardValue {
   v?: unknown
   /** Per-render nonce so re-rendered cards are not collapsed by the SDK's click dedup. */
   n?: number
+  /** Group card owner. Callbacks from anyone else are ignored. */
+  o?: string
 }
 
 export interface CardAction {
@@ -481,6 +483,287 @@ export function makeSubmittedCard(format: MakeFormat, instruction: string, fileC
   )
 }
 
+/**
+ * 创作工作台预览，功能与网页端一致：文案、海报、电商套图。
+ * 没有风格、比例或模板选择。私聊发送「创作工作台」打开。
+ */
+export const STUDIO_POINTS = 120
+export const STUDIO_COST = 10
+
+export type StudioKind = "copy" | "poster" | "commerce"
+
+const STUDIO_ACTIONS: Array<{ kind: StudioKind; label: string; placeholder: string }> = [
+  { kind: "copy", label: "文案创作", placeholder: "描述要写的文案" },
+  { kind: "poster", label: "海报生成", placeholder: "描述要生成的海报" },
+  { kind: "commerce", label: "电商套图", placeholder: "描述要生成的电商套图" },
+]
+
+export function studioKindFrom(value: string | undefined): StudioKind {
+  return STUDIO_ACTIONS.some((item) => item.kind === value) ? (value as StudioKind) : "copy"
+}
+
+function studioAction(kind: StudioKind): { kind: StudioKind; label: string; placeholder: string } {
+  return STUDIO_ACTIONS.find((item) => item.kind === kind) ?? STUDIO_ACTIONS[0]!
+}
+
+export interface StudioDraft {
+  kind: StudioKind
+  prompt?: string
+  product?: string
+  channel?: string
+  language?: string
+  words?: string
+  scene?: string
+  selling?: string
+  platform?: string
+  tone?: string
+  notice?: string
+}
+
+const STUDIO_CHANNELS = [
+  "淘宝/天猫",
+  "京东",
+  "拼多多",
+  "抖音电商",
+  "Shopee",
+  "Lazada",
+  "Amazon",
+  "Temu",
+  "小红书",
+  "Instagram",
+  "朋友圈",
+  "抖音封面",
+  "TikTok",
+  "快手",
+  "公众号封面",
+  "通用电商",
+]
+const STUDIO_LANGUAGES = ["繁体中文", "简体中文"]
+const STUDIO_PLATFORMS = ["Facebook", "Instagram", "Twitter", "YouTube", "小红书", "知乎", "微博", "短视频脚本", "推广短信", "公众号"]
+const STUDIO_TONES = ["广东粤语", "内地普通话", "英语"]
+
+export function studioCard(draft: StudioDraft = { kind: "copy" }): object {
+  const nonce = nextFormNonce()
+  const kind = draft.kind
+  const action = studioAction(kind)
+  const pick = (item: (typeof STUDIO_ACTIONS)[number]) =>
+    formSubmitButton(
+      item.kind === kind ? `● ${item.label}` : item.label,
+      { n: nonce, k: "studio", d: item.kind },
+      item.kind === kind ? "primary" : "default",
+      `pick_${item.kind}`,
+    )
+  const elements: object[] = [
+    { tag: "markdown", content: `**积分余额：${STUDIO_POINTS}**` },
+    { tag: "markdown", content: "**选择功能**" },
+    buttonRow(STUDIO_ACTIONS.map(pick)),
+    { tag: "markdown", content: `**${action.label}**` },
+  ]
+  if (kind === "commerce") {
+    elements.push({
+      tag: "input",
+      name: "product",
+      width: "fill",
+      default_value: draft.product,
+      placeholder: { tag: "plain_text", content: "产品名称，如：轻便拖鞋" },
+    })
+    elements.push({ tag: "markdown", content: "**渠道**" })
+    elements.push(
+      selectStatic(
+        "channel",
+        "选择渠道",
+        STUDIO_CHANNELS.map((name) => selectOption(name, name)),
+        draft.channel ?? "淘宝/天猫",
+      ),
+    )
+    elements.push({ tag: "markdown", content: "**语言**" })
+    elements.push(
+      selectStatic(
+        "language",
+        "选择语言",
+        STUDIO_LANGUAGES.map((name) => selectOption(name, name)),
+        draft.language ?? "繁体中文",
+      ),
+    )
+  } else if (kind === "copy") {
+    elements.push({ tag: "markdown", content: "**场景需求**" })
+    elements.push({
+      tag: "input",
+      name: "scene",
+      width: "fill",
+      default_value: draft.scene,
+      placeholder: { tag: "plain_text", content: "填写使用场景" },
+    })
+    elements.push({ tag: "markdown", content: "**产品名称**" })
+    elements.push({
+      tag: "input",
+      name: "product",
+      width: "fill",
+      default_value: draft.product,
+      placeholder: { tag: "plain_text", content: "填写产品名称" },
+    })
+    elements.push({ tag: "markdown", content: "**核心卖点/促销优惠信息**" })
+    elements.push({
+      tag: "input",
+      name: "selling",
+      width: "fill",
+      default_value: draft.selling,
+      placeholder: { tag: "plain_text", content: "可不填" },
+    })
+    elements.push({ tag: "markdown", content: "**平台选择**" })
+    elements.push(
+      selectStatic(
+        "platform",
+        "选择平台",
+        STUDIO_PLATFORMS.map((name) => selectOption(name, name)),
+        draft.platform ?? "Twitter",
+      ),
+    )
+    elements.push({ tag: "markdown", content: "**语言风格**" })
+    elements.push(
+      selectStatic(
+        "tone",
+        "选择语言风格",
+        STUDIO_TONES.map((name) => selectOption(name, name)),
+        draft.tone ?? "广东粤语",
+      ),
+    )
+    elements.push({ tag: "markdown", content: "**输出字数**" })
+    elements.push({
+      tag: "input",
+      name: "words",
+      width: "fill",
+      default_value: draft.words || "200",
+      placeholder: { tag: "plain_text", content: "例如 200" },
+    })
+  } else {
+    elements.push({
+      tag: "input",
+      name: "prompt",
+      width: "fill",
+      input_type: "multiline_text",
+      rows: 3,
+      max_length: 500,
+      default_value: draft.prompt,
+      placeholder: { tag: "plain_text", content: action.placeholder },
+    })
+  }
+  if (draft.notice) elements.push({ tag: "markdown", content: `<font color='orange'>${escapeMarkdown(draft.notice)}</font>` })
+  elements.push({ tag: "markdown", content: `本次生成预计消耗：**${STUDIO_COST}** 积分` })
+  elements.push(buttonRow([formSubmitButton("开始生成", { n: nonce, k: "studio", d: "start", f: kind }, "primary", "start")]))
+  return baseCard("AI 创作工作台", "blue", [{ tag: "form", name: "studio_form", elements }])
+}
+
+export function studioPendingCard(): object {
+  return statusCard("AI 创作工作台", "正在生成中，请稍候。完成后这张卡片会自动更新。", "turquoise")
+}
+
+export function studioResultCard(draft: StudioDraft): object {
+  const nonce = nextFormNonce()
+  const left = Math.max(0, STUDIO_POINTS - STUDIO_COST)
+  const action = studioAction(draft.kind)
+  const detail =
+    draft.kind === "commerce"
+      ? `产品：${escapeMarkdown(draft.product ?? "")}\n渠道：${escapeMarkdown(draft.channel ?? "淘宝/天猫")}\n语言：${escapeMarkdown(draft.language ?? "繁体中文")}`
+      : draft.kind === "copy"
+        ? [
+            `场景需求：${escapeMarkdown(draft.scene ?? "")}`,
+            `产品名称：${escapeMarkdown(draft.product ?? "")}`,
+            `核心卖点：${escapeMarkdown(draft.selling?.trim() ? draft.selling : "未填写")}`,
+            `平台：${escapeMarkdown(draft.platform ?? "Twitter")}`,
+            `语言风格：${escapeMarkdown(draft.tone ?? "广东粤语")}`,
+            `输出字数：${escapeMarkdown(draft.words || "200")}`,
+          ].join("\n")
+        : escapeMarkdown(draft.prompt ?? "")
+  return baseCard(`${action.label}结果`, "green", [
+    {
+      tag: "markdown",
+      content: `**${action.label}**\n\n${detail}\n\n<font color='grey'>网页接口还没接上，这里先回显你填的内容。</font>`,
+    },
+    { tag: "markdown", content: `本次消耗 ${STUDIO_COST} 积分，剩余可用积分：${left}。` },
+    buttonRow([
+      callbackButton(
+        "修改内容",
+        {
+          n: nonce,
+          k: "studio",
+          d: "back",
+          f: draft.kind,
+          v: {
+            prompt: draft.prompt ?? "",
+            product: draft.product ?? "",
+            channel: draft.channel ?? "",
+            language: draft.language ?? "",
+            words: draft.words ?? "",
+            scene: draft.scene ?? "",
+            selling: draft.selling ?? "",
+            platform: draft.platform ?? "",
+            tone: draft.tone ?? "",
+          },
+        },
+        "primary",
+      ),
+    ]),
+  ])
+}
+
+/** 验证码登录预览。文案改这里。私聊发送「验证码登录」打开。不会真正发送短信。 */
+export interface LoginDraft {
+  phone?: string
+  code?: string
+  notice?: string
+  sent?: boolean
+}
+
+export function maskPhone(phone: string): string {
+  const digits = phone.replace(/\D/g, "")
+  if (digits.length < 7) return "已绑定"
+  return `${digits.slice(0, 3)}****${digits.slice(-4)}`
+}
+
+export function loginCard(draft: LoginDraft = {}): object {
+  const nonce = nextFormNonce()
+  const elements: object[] = [
+    { tag: "markdown", content: "检测到您尚未绑定网页端账号，请先验证手机号完成登录。" },
+    { tag: "markdown", content: "**手机号**" },
+    {
+      tag: "input",
+      name: "phone",
+      width: "fill",
+      default_value: draft.phone,
+      placeholder: { tag: "plain_text", content: "请输入手机号" },
+    },
+    buttonRow([
+      formSubmitButton(
+        draft.sent ? "验证码已发送，请稍候再试" : "获取验证码",
+        { n: nonce, k: "login", d: "sms" },
+        draft.sent ? "default" : "primary",
+        "send_code",
+      ),
+    ]),
+    { tag: "markdown", content: "**验证码**" },
+    {
+      tag: "input",
+      name: "code",
+      width: "fill",
+      max_length: 6,
+      default_value: draft.code,
+      placeholder: { tag: "plain_text", content: "请输入 6 位验证码" },
+    },
+  ]
+  if (draft.notice) elements.push({ tag: "markdown", content: `<font color='orange'>${escapeMarkdown(draft.notice)}</font>` })
+  elements.push(buttonRow([formSubmitButton("确认绑定并登录", { n: nonce, k: "login", d: "confirm" }, "primary", "confirm")]))
+  return baseCard("账号绑定", "blue", [{ tag: "form", name: "login_form", elements }])
+}
+
+export function loginDoneCard(phone: string): object {
+  return statusCard(
+    "账号绑定成功",
+    `当前积分：${STUDIO_POINTS}\n绑定手机号：${maskPhone(phone)}\n\n<font color='grey'>这是预览，手机号和验证码没有发给网页端。</font>`,
+    "green",
+  )
+}
+
 function selectStatic(name: string, placeholder: string, options: object[], initial?: string): object {
   const el: Record<string, unknown> = {
     tag: "select_static",
@@ -596,6 +879,15 @@ export function isMailJob(job: CronJobInfo): boolean {
   return /邮件|邮箱/.test(job.name) || /S64|邮件查收/.test(job.prompt)
 }
 
+/** Stable per-user job name. The manage card shows it as 「邮件管理」. */
+export function mailJobName(openId: string): string {
+  return `邮件管理#${openId.slice(-8)}`
+}
+
+export function mailJobTitle(name: string): string {
+  return name.startsWith("邮件管理#") ? "邮件管理" : name
+}
+
 /** 邮件订阅表单的编辑上下文：名称 + 原调度（日报逻辑固定，编辑只改频率/时间）。 */
 export interface MailSubscribeEdit {
   name: string
@@ -603,12 +895,10 @@ export interface MailSubscribeEdit {
 }
 
 /**
- * 邮件订阅表单卡：用户发「邮件订阅」弹出。表单只有「总结频率 + 推送时间」——
- * 日报逻辑固定（着重列出需要尽快回复的邮件、未来两周内有截止日期的事项，
- * 范围随频率：每天→前一天，每周→前一周，每月→前 30 天），用户无需填写任何
- * 要求。提交走 cron-mail-sub，由 interactions 组装成 cron 任务。
+ * 邮件订阅表单卡。第一次订阅要填自己的飞书邮箱；编辑已有订阅只改频率和时间。
+ * 提交走 cron-mail-sub。
  */
-export function mailSubscribeCard(edit?: MailSubscribeEdit, mailboxMissing = false): object {
+export function mailSubscribeCard(edit?: MailSubscribeEdit, notice?: string): object {
   const preset = edit ? scheduleToForm(edit.schedule) : {}
   const nonce = nextFormNonce()
   const freqOptions = FREQ_PAIRS.map(([label, value]) => selectOption(label, value))
@@ -616,8 +906,8 @@ export function mailSubscribeCard(edit?: MailSubscribeEdit, mailboxMissing = fal
     {
       tag: "markdown",
       content: edit
-        ? `正在编辑 **${escapeMarkdown(edit.name)}**，调整后提交即可替换。`
-        : "选择总结频率和时间即可，日报逻辑是固定的：按时整理你的收件箱，**着重列出需要尽快回复的邮件、未来两周内有截止日期需要你处理的事项**；没有就直说没有。\n重要性「高」的新邮件会实时单独推送，不必等日报。",
+        ? `正在编辑 **${escapeMarkdown(mailJobTitle(edit.name))}**，调整后提交即可替换。邮箱沿用上次填写的，不用再填。`
+        : "选择总结频率和时间，并填写**你自己的飞书邮箱**。日报只读这个邮箱：按时整理收件箱，**着重列出需要尽快回复的邮件、未来两周内有截止日期需要你处理的事项**；没有就直说没有。\n重要性「高」的新邮件会实时单独推送给你。",
     },
     { tag: "markdown", content: "**🔁 总结频率**" },
     selectStatic("freq", edit ? `原频率：${humanSchedule(edit.schedule).replace(/\s+\d+:.*/, "")}` : "选择频率", freqOptions, preset.freq),
@@ -625,18 +915,26 @@ export function mailSubscribeCard(edit?: MailSubscribeEdit, mailboxMissing = fal
     selectStatic("hour", edit ? `原时间：${humanSchedule(edit.schedule).match(/\d+:\d+$/)?.[0] ?? ""}` : "选择小时", hourOptions(), preset.hour),
     selectStatic("minute", "选择分钟", minuteOptions(), preset.minute),
   ]
-  if (mailboxMissing) {
+  if (!edit) {
+    elements.push({ tag: "markdown", content: "**邮箱**" })
+    elements.push({
+      tag: "input",
+      name: "email",
+      width: "fill",
+      placeholder: { tag: "plain_text", content: "填写你的飞书邮箱" },
+    })
+  }
+  if (notice) {
     elements.push({
       tag: "markdown",
-      content: "<font color='orange'>⚠️ 你还没绑定邮箱——提交后发一句「绑定邮箱」，我会自动绑定你飞书账号登记的邮箱（只能绑自己的）。</font>",
-      text_size: "notation",
+      content: `<font color='orange'>${escapeMarkdown(notice)}</font>`,
     })
   }
   elements.push(
     { tag: "hr" },
     {
       tag: "markdown",
-      content: "<font color='grey'>总结范围随频率：每天一次总结前一天，每周一次总结前一周，每月一次总结前 30 天。邮箱接口只读：不会删除、移动、标记或回复任何邮件。想自动转发请在飞书邮箱 App 的「设置 > 收信规则」里配置。</font>",
+      content: "<font color='grey'>总结范围随频率：每天一次总结前一天，每周一次总结前一周，每月一次总结前 30 天。邮箱必须是你飞书账号登记的企业邮箱。接口只读：不会删除、移动、标记或回复任何邮件。</font>",
       text_size: "notation",
     },
     buttonRow([
@@ -672,7 +970,7 @@ export function cronManageCard(jobs: CronJobInfo[]): object {
     // 邮件类订阅的 prompt 是一段技术性指令，主标题直接显示名称更友好；
     // 资讯订阅保持原样（prompt 截断为主标题，灰色小字显示名称）。
     const mail = isMailJob(job)
-    const title = mail ? job.name : job.prompt.slice(0, 40)
+    const title = mail ? mailJobTitle(job.name) : job.prompt.slice(0, 40)
     const sub = mail ? escapeMarkdown(status) : `${escapeMarkdown(job.name)} · ${escapeMarkdown(status)}`
     elements.push({
       tag: "markdown",
@@ -930,7 +1228,7 @@ export function helpCard(): object {
     "**新建对话** — 点击下方菜单，开启一个全新会话",
     "**停止生成** — 点击下方菜单，停掉正在进行的任务",
     "**资讯订阅** — 点击菜单「订阅 > 资讯订阅」，在弹出的卡片里点选频率、时间并填写内容即可\n  也可直接发文字：订阅 每周一 9:00 FTTR 相关资讯",
-    "**邮件订阅** — 点击菜单「订阅 > 邮件订阅」，选择频率和时间即可：按时整理收件箱推送日报，着重列出需要尽快回复的邮件和截止日期临近的事项；重要邮件实时推送\n  首次使用先发「绑定邮箱」：自动绑定你飞书账号登记的邮箱（只能绑自己的，填别人的地址会被拒绝）",
+    "**邮件订阅** — 点击菜单「订阅 > 邮件订阅」。第一次要填写你自己的飞书邮箱，之后只读这个邮箱；编辑已有订阅不用再填邮箱。按时整理收件箱，重要邮件实时推送给你",
     "**我的订阅** — 点击菜单「订阅 > 我的订阅」弹出管理卡片：查看全部订阅，可暂停 / 恢复 / 编辑 / 删除",
     "**模板库** — 发送「模板库」查看 PPT 模板（发 .pptx 并写「存为模板 名字」可新增）",
     "**我的技能** — 发「技能」打开管理卡片：卡片里填名称、触发词、执行步骤与输出要求，保存即生效\n  以后聊天里出现触发词就会自动按这条技能执行；也可用「用XX技能」显式指定",

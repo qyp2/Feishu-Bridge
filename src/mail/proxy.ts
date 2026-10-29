@@ -8,6 +8,11 @@ const OPEN_API = "https://open.feishu.cn/open-apis"
 /** Query params the agent may pass through to the list endpoint. Everything else is dropped. */
 const LIST_QUERY_ALLOW = new Set(["folder_id", "label_id", "only_unread", "page_size", "page_token"])
 
+function header(value: string | string[] | undefined): string {
+  const raw = Array.isArray(value) ? value[0] : value
+  return typeof raw === "string" ? raw.trim() : ""
+}
+
 export interface MailProxyDeps {
   config: AppConfig
   binding: MailBindingStore
@@ -24,10 +29,10 @@ export interface MailProxyDeps {
  * bot could talk the agent into reading someone else's mailbox.
  *
  * Here the agent never sees credentials: it calls this proxy, and the proxy
- * resolves the mailbox exclusively from the bridge-owned binding file (written
- * only by the 「绑定邮箱」 command after contact-API ownership verification).
- * There is no request parameter for choosing a mailbox — the caller simply
- * cannot ask for anyone else's mail.
+ * resolves the mailbox from the scope token in the caller's session directory
+ * (written only by the bridge for that Feishu user). There is no request
+ * parameter for choosing a mailbox — a missing or unknown token is refused,
+ * and the call never falls through to another user's inbox.
  *
  * Exposed endpoints (GET only, 127.0.0.1 only):
  *   /mail/list?<folder_id|label_id|only_unread|page_size|page_token>
@@ -73,12 +78,13 @@ export class MailProxy {
       return
     }
 
-    const binding = this.deps.binding.get()
-    if (!binding) {
-      this.json(res, 409, { code: 40901, msg: "mailbox not bound: send 「绑定邮箱」 in chat to bind your own mailbox first" })
+    const scope = header(req.headers["x-mail-scope"])
+    const found = scope ? this.deps.binding.findByScope(scope) : undefined
+    if (!found) {
+      this.json(res, 409, { code: 40901, msg: "mailbox not bound for this chat: subscribe and fill in your own mailbox first" })
       return
     }
-    const mailbox = encodeURIComponent(binding.email)
+    const mailbox = encodeURIComponent(found.binding.email)
 
     let pathname: string
     if (messageMatch) {
@@ -96,7 +102,7 @@ export class MailProxy {
       pathname = `/mail/v1/user_mailboxes/${mailbox}/messages?${params}`
     }
 
-    this.deps.audit.record("mail.proxy", { endpoint: messageMatch ? "get" : "list", mailbox: binding.email })
+    this.deps.audit.record("mail.proxy", { endpoint: messageMatch ? "get" : "list", mailbox: found.binding.email, openId: found.openId })
     const data = await this.api(pathname)
     // Pass the Feishu response through verbatim (code/msg/data) so the agent
     // side keeps its existing error handling (e.g. 99991672/99991679 hints).

@@ -1,4 +1,3 @@
-import { randomBytes } from "node:crypto"
 import fs from "node:fs"
 import path from "node:path"
 import { pathToFileURL, fileURLToPath } from "node:url"
@@ -9,7 +8,8 @@ import type { OpencodeService } from "../opencode/service.js"
 import type { OpencodeEventBus } from "../opencode/events.js"
 import type { OpencodeClient } from "../opencode/client.js"
 import { BindingStore, type Binding } from "../storage/bindings.js"
-import type { FeishuBot } from "../feishu/bot.js"
+import { mentionsFor, type FeishuBot, type SendOptions } from "../feishu/bot.js"
+import { asksToChangeLocalConfig, CONFIG_CHANGE_DENIED } from "./configGuard.js"
 import type { OpencodeEvent, PromptFileAttachment, SessionInfo } from "../opencode/types.js"
 import type {
   ExecutionData,
@@ -22,25 +22,26 @@ import type {
   ToolProgressData,
 } from "../opencode/types.js"
 import { AsyncQueue, KeyedSerial, createThrottle, sleep } from "../util/async.js"
-import { ensureDir, ensureProjectLink, safeSegment } from "../util/paths.js"
-import { gapDoneCard, gapFillCard, gapRetryCard, makeFormCard, markdownCard, nextFormNonce, welcomeCard, type MakeFormat, type MakeFormData, type MakeFormPreset } from "../feishu/cards.js"
+import { ensureDir, ensureProjectLink, safeFileName, safeSegment } from "../util/paths.js"
+import { isWorkbookFile } from "./office.js"
+import { gapDoneCard, gapRetryCard, makeFormCard, markdownCard, nextFormNonce, welcomeCard, type MakeFormat, type MakeFormData, type MakeFormPreset } from "../feishu/cards.js"
 import { ensureInstructions, extractFileMarkers } from "./instructions.js"
 import {
   emitOfficeFile,
   emitRequestedOffice,
   fillMarkdown,
-  findContentGaps,
-  latestDeliverableMarkdown,
-  requestedFormats,
 } from "./publish.js"
 import { fitCardMarkdown, isProgressShell, TurnAccumulator, spinnerFrame, type TranscriptMessage } from "./turn.js"
 import { CommandHandler } from "./commands.js"
+import { writeMailScope, type MailBindingStore } from "../mail/binding.js"
 import { renderSkillBlock, SkillStore, type Skill } from "../skills/store.js"
 
 export interface SessionContext {
   botName: string
   chatId: string
   replyTo?: string
+  chatType?: "p2p" | "group"
+  userOpenId?: string
 }
 
 interface TurnState {
@@ -113,7 +114,6 @@ const FILE_BURST_WAIT_MS = 1_200
 const TURN_IDLE_TIMEOUT_MS = 60 * 60 * 1000
 /** No assistant text and not busy for this long means the run never started. */
 const EMPTY_TURN_GRACE_MS = 3 * 60_000
-const MAX_GAP_FIELDS = 20
 const OFFICE_OUTPUT_EXT = /\.(?:pptx|docx|xlsx|pdf)$/i
 
 interface GapFillRecord {
@@ -138,6 +138,12 @@ interface GapFillRecord {
  * message looks like a text prompt and is sent to the agent immediately.
  */
 const RESOURCE_PLACEHOLDER = /!\[[^\]]*\]\([^)]*\)|<(?:file|audio|video|media|sticker|folder)\b[^>]*\/?>/gi
+
+/** Card markdown @ syntax. Kept on the card itself, because streaming updates replace the whole body. */
+function cardMentionPrefix(chatType: string, openId?: string): string {
+  if (chatType !== "group" || !openId) return ""
+  return `<at id=${openId}></at>\n`
+}
 
 function stripResourcePlaceholders(input: string): string {
   return input.replace(RESOURCE_PLACEHOLDER, "").trim()
@@ -172,6 +178,11 @@ function menuCommand(text: string): string {
   if (/^(?:Excel\s*(?:表格|生成|制作)?|生成\s*Excel|表格生成)$/i.test(text)) return "/make excel"
   if (text === "文案制作" || text === "制作文案") return "/make copy"
   if (text === "海报制作" || text === "制作海报") return "/make poster"
+  if (text === "创作工作台") return "/studio copy"
+  if (text === "生成海报" || text === "海报生成") return "/studio poster"
+  if (text === "生成文案" || text === "文案创作") return "/studio copy"
+  if (text === "电商套图") return "/studio commerce"
+  if (text === "验证码登录" || text === "账号绑定") return "/login"
   if (text === "邮件订阅") return "/cron mail"
   // 邮箱绑定收归 bridge：contact API 校验「地址属于操作者本人」后才写配置，
   // 不放行给 agent 自由填写（否则输入别人的邮箱号也能绑）。
@@ -244,6 +255,7 @@ export class ConversationService {
   /** Turns that are still running, so a pause can stop them without waiting in line. */
   private readonly activeTurns = new Map<string, { sessionID: string; settle: (error?: string) => void }>()
   private readonly commands: CommandHandler
+  private mailBinding?: MailBindingStore
   private readonly linkedProjects = new Set<string>()
   /** 个性化技能库（桥接侧，按用户隔离）。 */
   readonly skills: SkillStore
@@ -317,6 +329,23 @@ export class ConversationService {
     return this.commands
   }
 
+  setMailBinding(store: MailBindingStore): void {
+    this.mailBinding = store
+  }
+
+  /** Drop this user's scope token into the session directory the mail tool reads. */
+  plantMailScope(bot: FeishuBot, chatId: string, openId: string, chatType: "p2p" | "group"): void {
+    const root = bot.config.location ?? this.deps.config.opencode.location
+    const userId = bot.config.perUserInGroup && chatType === "group" ? openId : undefined
+    this.writeMailScope(BindingStore.directory(root, bot.name, chatId, userId), openId)
+  }
+
+  private writeMailScope(directory: string, openId: string): void {
+    const scope = this.mailBinding?.get(openId)?.scope
+    if (!scope) return
+    writeMailScope(directory, scope)
+  }
+
   // ---- entry point --------------------------------------------------------
 
   async handleMessage(bot: FeishuBot, msg: NormalizedMessage): Promise<void> {
@@ -346,7 +375,8 @@ export class ConversationService {
     // serializes card-action callbacks onto that same tail, and a turn that is
     // blocked on an interactive question would otherwise deadlock the callback
     // (Feishu then reports "目标回调服务超时未响应"). Returning here frees the
-    // tail; we keep per-chat ordering ourselves via the keyed serial runner.
+    // tail; we keep ordering ourselves via the keyed serial runner. In a group
+    // with perUserInGroup, each sender has a separate key so people can run at once.
     // A text-only message waits briefly so file messages from the same send
     // can be stored first. Feishu often delivers the instruction before the files.
     if (isPause(text)) {
@@ -357,11 +387,13 @@ export class ConversationService {
       await bot
         .sendMarkdown(msg.chatId, "当前任务还在进行。点击下方菜单「停止生成」可停下来，停下来之后再发新内容。", {
           replyTo: msg.messageId,
+          mentions: mentionsFor(msg.chatType, msg.senderId, msg.senderName),
         })
         .catch(() => {})
       return
     }
-    const key = `msg:${bot.name}:${msg.chatId}`
+    const isolate = bot.config.perUserInGroup && msg.chatType === "group"
+    const key = isolate ? `msg:${bot.name}:${msg.chatId}:${msg.senderId}` : `msg:${bot.name}:${msg.chatId}`
     const run = () => this.processMessage(bot, identity, msg, text)
     if (text.length > 0 && msg.resources.length === 0 && !text.startsWith("/")) {
       setTimeout(() => {
@@ -391,7 +423,10 @@ export class ConversationService {
       // 寒暄/启动词（无任务内容）：直接展示能力卡片，不进 agent。
       if (text.length > 0 && msg.resources.length === 0 && isGreeting(text)) {
         const templates = this.listTemplates(msg.senderId)
-        await bot.sendCard(msg.chatId, welcomeCard(templates.shared, templates.personal), { replyTo: msg.messageId }).catch(() => {})
+        await bot.sendCard(msg.chatId, welcomeCard(templates.shared, templates.personal), {
+          replyTo: msg.messageId,
+          mentions: mentionsFor(msg.chatType, msg.senderId, msg.senderName),
+        }).catch(() => {})
         this.deps.audit.record("greeting.shown", { bot: bot.name, chatId: msg.chatId })
         return
       }
@@ -402,7 +437,10 @@ export class ConversationService {
       // only when an instruction is sent, inside the prompt.
       if (text.length > 0 && msg.resources.length > 0) {
         await bot
-          .sendMarkdown(msg.chatId, "已收到。正在保存文件，保存完成后按你的指令开始解析。", { replyTo: msg.messageId })
+          .sendMarkdown(msg.chatId, "已收到。正在保存文件，保存完成后按你的指令开始解析。", {
+            replyTo: msg.messageId,
+            mentions: mentionsFor(msg.chatType, msg.senderId, msg.senderName),
+          })
           .catch(() => {})
       }
       const incoming = msg.resources.length > 0 ? await this.prepareAttachments(bot, msg, binding) : []
@@ -411,6 +449,7 @@ export class ConversationService {
         await bot
           .sendMarkdown(msg.chatId, "这轮文件没有保存下来。请把文件重新发一次；文件和指令可以分两条消息发。", {
             replyTo: msg.messageId,
+            mentions: mentionsFor(msg.chatType, msg.senderId, msg.senderName),
           })
           .catch(() => {})
         return
@@ -425,7 +464,7 @@ export class ConversationService {
         // waiting. Only when neither exists do we resolve a reference against
         // the chat's saved copies.
         if (files.length === 0) {
-          const cached = this.referencedFiles(
+          const cached = await this.referencedFiles(
             binding.chatId,
             path.join(binding.directory, "inbox"),
             text,
@@ -441,6 +480,7 @@ export class ConversationService {
             await bot
               .sendMarkdown(msg.chatId, "这一轮没有新文件，历史缓存里也没有对上的材料。请重新发送文件。", {
                 replyTo: msg.messageId,
+                mentions: mentionsFor(msg.chatType, msg.senderId, msg.senderName),
               })
               .catch(() => {})
             return
@@ -493,7 +533,7 @@ export class ConversationService {
       }
       // No text and no files: nothing to do.
     } catch (error) {
-      await this.reportError(bot, msg.chatId, msg.messageId, error)
+      await this.reportError(bot, msg.chatId, msg.messageId, error, mentionsFor(msg.chatType, msg.senderId, msg.senderName))
     }
   }
 
@@ -505,7 +545,10 @@ export class ConversationService {
   ): Promise<void> {
     const names = files.map((file) => file.name ?? "文件").join("、")
     const body = `已收到文件：${names}`
-    await bot.sendMarkdown(msg.chatId, body, { replyTo: msg.messageId }).catch((error) => {
+    await bot.sendMarkdown(msg.chatId, body, {
+      replyTo: msg.messageId,
+      mentions: mentionsFor(msg.chatType, msg.senderId, msg.senderName),
+    }).catch((error) => {
       this.deps.logger.warn("Failed to acknowledge attachments", {
         error: error instanceof Error ? error.message : String(error),
       })
@@ -603,6 +646,7 @@ export class ConversationService {
     const directory = BindingStore.directory(root, bot.name, chatId, scopedUser)
     ensureDir(directory)
     ensureInstructions(directory)
+    if (userOpenId) this.writeMailScope(directory, userOpenId)
     const session = await client.createSession({
       title: `定时预生成 ${new Date().toISOString()}`,
       agent: bot.config.agent,
@@ -698,7 +742,22 @@ export class ConversationService {
     if (existing) {
       try {
         const session = await client.getSession(existing.sessionID)
-        if (session?.id) return existing
+        if (session?.id) {
+          if (identity.chatType === "group" && existing.agent !== bot.config.agent) {
+            try {
+              await client.switchAgent(existing.sessionID, bot.config.agent)
+              existing.agent = bot.config.agent
+              this.deps.bindings.set(existing)
+            } catch (error) {
+              this.deps.logger.warn("Failed to restore the group session agent", {
+                key,
+                error: error instanceof Error ? error.message : String(error),
+              })
+            }
+          }
+          this.writeMailScope(existing.directory, identity.senderId)
+          return existing
+        }
       } catch {
         this.deps.logger.warn("Bound session no longer exists; creating a new one", {
           key,
@@ -712,7 +771,9 @@ export class ConversationService {
     const directory = BindingStore.directory(root, bot.name, identity.chatId, userId)
     ensureDir(directory)
     ensureInstructions(directory)
-    const title = identity.chatType === "p2p" ? `飞书私聊 ${identity.senderName ?? identity.senderId}` : `飞书群聊 ${identity.chatId}`
+    const who = identity.senderName ?? identity.senderId
+    const title =
+      identity.chatType === "p2p" ? `飞书私聊 ${who}` : userId ? `飞书群聊 ${who}` : `飞书群聊 ${identity.chatId}`
     const session = await client.createSession({
       title,
       agent: bot.config.agent,
@@ -740,7 +801,14 @@ export class ConversationService {
       updatedAt: Date.now(),
     }
     this.deps.bindings.set(binding)
-    this.deps.audit.record("session.created", { bot: bot.name, chatId: identity.chatId, sessionID: session.id, directory })
+    this.writeMailScope(directory, identity.senderId)
+    this.deps.audit.record("session.created", {
+      bot: bot.name,
+      chatId: identity.chatId,
+      userId,
+      sessionID: session.id,
+      directory,
+    })
     return binding
   }
 
@@ -799,7 +867,7 @@ export class ConversationService {
           continue
         }
         const savedName = resource.fileName ?? `${resource.type}_${safeSegment(resource.fileKey)}${guessExtension(buffer, resource.type)}`
-        const local = path.join(inbox, `${Date.now()}_${safeSegment(savedName)}`)
+        const local = path.join(inbox, `${Date.now()}_${safeFileName(savedName)}`)
         fs.writeFileSync(local, buffer)
         copyIntoCache(cache, local, savedName)
         files.push({ uri: pathToFileURL(local).href, name: savedName })
@@ -929,7 +997,7 @@ export class ConversationService {
     pending.preset = { ...pending.preset, files: valid }
     // 新渲染换编号进窗口(防 SDK 点击去重吞掉),旧卡面编号仍在窗口内有效。
     await bot
-      .updateCard(pending.messageId, makeFormCard(data, pending.preset, this.rollMakeFormNonce(chatId, openId)))
+      .updateCard(pending.messageId, makeFormCard(data, pending.preset, this.rollMakeFormNonce(chatId, openId)), openId)
       .catch(() => {})
   }
 
@@ -1097,7 +1165,10 @@ export class ConversationService {
       msg.resources.find((r) => r.type === "file")
     if (!resource) {
       await bot
-        .sendMarkdown(msg.chatId, "存模板需要一个 .pptx 文件，请把模板文件和这句话一起发。", { replyTo: msg.messageId })
+        .sendMarkdown(msg.chatId, "存模板需要一个 .pptx 文件，请把模板文件和这句话一起发。", {
+          replyTo: msg.messageId,
+          mentions: mentionsFor(msg.chatType, msg.senderId, msg.senderName),
+        })
         .catch(() => {})
       return
     }
@@ -1130,14 +1201,22 @@ export class ConversationService {
         .sendMarkdown(
           msg.chatId,
           `${headline}以后说「用${stem}模板」即可直接套用，不用再发文件。\n共享模板：${format(lists.shared)}\n我的模板：${format(lists.personal)}`,
-          { replyTo: msg.messageId },
+          {
+            replyTo: msg.messageId,
+            mentions: mentionsFor(msg.chatType, msg.senderId, msg.senderName),
+          },
         )
         .catch(() => {})
     } catch (error) {
       this.deps.logger.warn("Failed to save template", {
         error: error instanceof Error ? error.message : String(error),
       })
-      await bot.sendMarkdown(msg.chatId, "模板没有保存成功，请重发一次文件。", { replyTo: msg.messageId }).catch(() => {})
+      await bot
+        .sendMarkdown(msg.chatId, "模板没有保存成功，请重发一次文件。", {
+          replyTo: msg.messageId,
+          mentions: mentionsFor(msg.chatType, msg.senderId, msg.senderName),
+        })
+        .catch(() => {})
     }
   }
 
@@ -1145,11 +1224,16 @@ export class ConversationService {
    * Files this message did not attach. Only copies saved in the current task
    * count, and only when the user actually refers to them.
    */
-  private referencedFiles(chatId: string, inbox: string, text: string, since: number): PromptFileAttachment[] {
-    const matched = matchCachedFiles(
-      text,
-      listCachedFiles(this.cacheDir(chatId)).filter((file) => file.savedAt >= since),
-    )
+  private async referencedFiles(chatId: string, inbox: string, text: string, since: number): Promise<PromptFileAttachment[]> {
+    const cached = listCachedFiles(this.cacheDir(chatId)).filter((file) => file.savedAt >= since)
+    let matched = matchCachedFiles(text, cached)
+    if (matched.length === 0 && asksForSpreadsheets(text)) {
+      const books: CachedFile[] = []
+      for (const file of cached) {
+        if (await isWorkbookFile(file.path)) books.push(file)
+      }
+      matched = latestOf(books)
+    }
     return matched.map((file) => {
       const local = placeInInbox(inbox, file.path, file.name)
       return { uri: pathToFileURL(local).href, name: file.name }
@@ -1160,6 +1244,22 @@ export class ConversationService {
 
   async runTurn(request: TurnRequest): Promise<boolean> {
     const { bot, binding } = request
+    if (binding.chatType === "group" && request.source !== "cron" && asksToChangeLocalConfig(request.text)) {
+      this.deps.audit.record("config.change.denied", {
+        bot: bot.name,
+        chatId: binding.chatId,
+        userId: request.userOpenId ?? binding.userId,
+      })
+      if (!request.silent) {
+        await bot
+          .sendMarkdown(binding.chatId, CONFIG_CHANGE_DENIED, {
+            replyTo: request.replyTo,
+            mentions: mentionsFor("group", request.userOpenId ?? binding.userId),
+          })
+          .catch(() => {})
+      }
+      return false
+    }
     return this.serial.run(binding.key, async () => {
       const startedAt = Date.now()
       // 个性化技能：显式点名（卡片「试用」/`/skill use`）优先，否则按发送者的消息做触发词匹配。
@@ -1222,7 +1322,8 @@ export class ConversationService {
           const waiting = raw.length > 0 ? raw : `${spinnerFrame()} 收到，正在生成`
           const withError =
             closed && failure ? (failure === "已暂停" ? `${waiting}\n\n已暂停` : `${waiting}\n\n> ⚠️ ${failure}`) : waiting
-          const body = fitCardMarkdown(withError)
+          const mention = request.source === "user" ? cardMentionPrefix(binding.chatType, request.userOpenId) : ""
+          const body = mention + fitCardMarkdown(withError)
           if (!force && body === lastCardBody) return
           lastCardBody = body
           try {
@@ -1240,7 +1341,13 @@ export class ConversationService {
         }
       }
 
-      const context: SessionContext = { botName: bot.name, chatId: binding.chatId, replyTo: request.replyTo }
+      const context: SessionContext = {
+        botName: bot.name,
+        chatId: binding.chatId,
+        replyTo: request.replyTo,
+        chatType: binding.chatType,
+        userOpenId: request.userOpenId ?? binding.userId,
+      }
       this.contexts.set(binding.sessionID, context)
 
       const streamPromise = request.silent
@@ -1356,7 +1463,10 @@ export class ConversationService {
         const fallback =
           failure === "已暂停" ? `${rendered}\n\n已暂停` : failure ? `${rendered}\n\n> ⚠️ ${failure}` : rendered
         try {
-          await bot.sendCardResilient(binding.chatId, markdownCard(accumulator.headline(), fallback), { replyTo: request.replyTo })
+          await bot.sendCardResilient(binding.chatId, markdownCard(accumulator.headline(), fallback), {
+            replyTo: request.replyTo,
+            mentions: request.source === "user" ? mentionsFor(binding.chatType, request.userOpenId) : undefined,
+          })
           delivered = true
         } catch (error) {
           this.deps.logger.error("Failed to send fallback reply", {
@@ -1366,25 +1476,21 @@ export class ConversationService {
       }
 
       const { files } = paused ? { files: [] as { kind: "file" | "image"; path: string }[] } : extractFileMarkers(visible)
-      const heldSource = paused ? undefined : await this.offerGapFill(bot, binding, request, startedAt)
-      const heldPath = heldSource ? path.resolve(heldSource) : undefined
       // A finished office file makes the markdown beside it an intermediate
       // draft: never upload it, and register it as handled so the recovery
       // sweep does not push it later either.
       const suppressMarkdown = !paused && this.hasFreshOfficeOutput(binding.directory, startedAt)
       const suppressed: string[] = []
       const outgoing = files.filter((file) => {
-        const resolved = path.resolve(file.path)
-        if (heldPath && resolved === heldPath) return false
         if (suppressMarkdown && file.path.toLowerCase().endsWith(".md")) {
-          suppressed.push(resolved)
+          suppressed.push(path.resolve(file.path))
           return false
         }
         return true
       })
       const sent = await this.deliverFiles(bot, binding.chatId, outgoing, request.replyTo)
       for (const item of suppressed) sent.add(item)
-      if (!heldSource && !paused) {
+      if (!paused) {
         try {
           const office = await emitRequestedOffice({
             directory: binding.directory,
@@ -1413,7 +1519,6 @@ export class ConversationService {
         durationMs: Date.now() - startedAt,
         route: routeFrom(visible),
         sent: [...sent].map((file) => path.basename(file)),
-        gapFill: Boolean(heldSource),
         paused,
         failure,
         text: request.text.slice(0, 120),
@@ -1448,7 +1553,10 @@ export class ConversationService {
   private async pauseTurn(bot: FeishuBot, identity: ChatIdentity, replyTo?: string): Promise<void> {
     const active = this.activeTurns.get(this.bindingKey(bot, identity))
     if (!active) {
-      await bot.sendMarkdown(identity.chatId, "当前没有正在进行的任务。", { replyTo }).catch(() => {})
+      await bot.sendMarkdown(identity.chatId, "当前没有正在进行的任务。", {
+        replyTo,
+        mentions: mentionsFor(identity.chatType, identity.senderId, identity.senderName),
+      }).catch(() => {})
       return
     }
     try {
@@ -1461,7 +1569,10 @@ export class ConversationService {
       })
     }
     active.settle("已暂停")
-    await bot.sendMarkdown(identity.chatId, "已暂停", { replyTo }).catch(() => {})
+    await bot.sendMarkdown(identity.chatId, "已暂停", {
+      replyTo,
+      mentions: mentionsFor(identity.chatType, identity.senderId, identity.senderName),
+    }).catch(() => {})
   }
 
   /** Remember the streaming card so a restart can finish it instead of leaving the spinner. */
@@ -1685,68 +1796,9 @@ export class ConversationService {
   }
 
   /**
-   * When the deliverable still has 「未提供」 sections, ask the user to type them
-   * before any office file is built. Returns the markdown path while that card
-   * is waiting, so the unfinished file is not uploaded yet.
+   * Finish a gap-fill card that was sent before this path was removed.
+   * New turns no longer create these cards; missing text is supplied in chat.
    */
-  private async offerGapFill(
-    bot: FeishuBot,
-    binding: Binding,
-    request: TurnRequest,
-    startedAt: number,
-  ): Promise<string | undefined> {
-    const fileNames = (request.files ?? []).map((file) => file.name ?? file.uri)
-    if (requestedFormats(request.text, fileNames).length === 0) return undefined
-    const source = latestDeliverableMarkdown(binding.directory, startedAt)
-    if (!source) return undefined
-    let markdown: string
-    try {
-      markdown = fs.readFileSync(source, "utf8")
-    } catch {
-      return undefined
-    }
-    const gaps = findContentGaps(markdown)
-    if (gaps.length === 0) return undefined
-    const shown = gaps.slice(0, MAX_GAP_FIELDS)
-    const token = randomBytes(8).toString("hex")
-    const record: GapFillRecord = {
-      token,
-      botName: bot.name,
-      chatId: binding.chatId,
-      replyTo: request.replyTo,
-      directory: binding.directory,
-      source,
-      requestText: request.text,
-      fileNames,
-      templatePath: this.resolveTemplate(request.text, request.files, request.userOpenId),
-      startedAt,
-    }
-    const recordPath = path.join(this.gapDir(), `${token}.json`)
-    fs.writeFileSync(recordPath, JSON.stringify(record), "utf8")
-    const omitted = gaps.length - shown.length
-    try {
-      await bot.sendCardResilient(binding.chatId, gapFillCard(token, shown, true, omitted), { replyTo: request.replyTo })
-    } catch (error) {
-      this.deps.logger.warn("Gap card rejected multiline inputs; retrying with single-line inputs", {
-        error: error instanceof Error ? error.message : String(error),
-      })
-      try {
-        await bot.sendCardResilient(binding.chatId, gapFillCard(token, shown, false, omitted), {
-          replyTo: request.replyTo,
-        })
-      } catch (fallbackError) {
-        fs.rmSync(recordPath, { force: true })
-        this.deps.logger.warn("Failed to send gap fill card; continuing with placeholders", {
-          error: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
-        })
-        return undefined
-      }
-    }
-    this.deps.audit.record("gap.requested", { chatId: binding.chatId, token, count: shown.length, omitted })
-    return source
-  }
-
-  /** Write the typed sections into the markdown, then build and upload the office file. */
   async completeGapFill(
     bot: FeishuBot,
     token: string,
@@ -1900,18 +1952,25 @@ export class ConversationService {
     }
   }
 
-  async reportError(bot: FeishuBot, chatId: string, replyTo: string | undefined, error: unknown): Promise<void> {
+  async reportError(
+    bot: FeishuBot,
+    chatId: string,
+    replyTo: string | undefined,
+    error: unknown,
+    mentions?: SendOptions["mentions"],
+  ): Promise<void> {
     const message = error instanceof Error ? error.message : String(error)
     this.deps.logger.error("Conversation error", { chatId, error: message })
     this.deps.audit.record("error", { bot: bot.name, chatId, error: message })
     try {
-      await bot.sendCard(chatId, errorCard(message), { replyTo })
-    } catch {
-      // give up silently
+      await bot.sendCard(chatId, errorCard(message), { replyTo, mentions })
+    } catch (sendError) {
+      this.deps.logger.error("Failed to report conversation error", {
+        chatId,
+        error: sendError instanceof Error ? sendError.message : String(sendError),
+      })
     }
   }
-
-  // ---- orphaned-completion recovery --------------------------------------
 
   /**
    * Start the recovery sweep. Bound sessions whose turn has already ended but
@@ -2157,13 +2216,14 @@ export class ConversationService {
     // drop the file, which is how a finished deck stayed out of the chat.
     const raw = turn.map((message) => message.text).filter((text) => text.length > 0).join("\n\n") || last.text
     const extracted = extractFileMarkers(raw)
-    const rendered = fitCardMarkdown(styleRouteFooter(extractFileMarkers(progress.render() || raw).text || extracted.text))
+    const rendered =
+      cardMentionPrefix(binding.chatType, binding.userId) +
+      fitCardMarkdown(styleRouteFooter(extractFileMarkers(progress.render() || raw).text || extracted.text))
     if (rendered.trim().length === 0 && extracted.files.length === 0) return
     this.deps.logger.warn("Delivering reply that outlived its turn", {
       bot: binding.bot,
       chatId: binding.chatId,
       sessionID: binding.sessionID,
-      messageID: last.id,
     })
     // Prefer rewriting the card that is still spinning. A new message is only
     // the fallback when that card can no longer be updated.
@@ -2359,7 +2419,15 @@ function routeFrom(text: string): string | undefined {
 /** 路由尾注弱化展示：灰色 + 斜体，与正文区分开（飞书流式卡片单元素不支持小字号）。 */
 function styleRouteFooter(text: string): string {
   if (!text) return text
-  return text.replace(ROUTE_LINE_FULL, (_line, footer: string) => `<font color='grey'>*${footer.trim()}*</font>`)
+  return stripClosingPitch(text).replace(ROUTE_LINE_FULL, (_line, footer: string) => `<font color='grey'>*${footer.trim()}*</font>`)
+}
+
+/** Drop the menu pitch the model appends after a finished answer. */
+function stripClosingPitch(text: string): string {
+  const marker = /\n+(?:如果要做成对外的材料|后续入口|接下来你可以|你还可以[:：])/
+  const match = marker.exec(text)
+  if (!match) return text
+  return text.slice(0, match.index).trimEnd()
 }
 
 /**
@@ -2396,7 +2464,8 @@ function templatePathFrom(files: PromptFileAttachment[] | undefined): string | u
 }
 
 function findSavedAttachment(dirs: string[], fileName: string): string | undefined {
-  const safe = safeSegment(fileName)
+  const safe = safeFileName(fileName)
+  const legacy = safeSegment(fileName)
   const hits: string[] = []
   for (const dir of dirs) {
     let names: string[]
@@ -2406,11 +2475,19 @@ function findSavedAttachment(dirs: string[], fileName: string): string | undefin
       continue
     }
     for (const name of names) {
-      if (name === safe || name.endsWith(`_${safe}`) || name.endsWith(`_${fileName}`)) hits.push(path.join(dir, name))
+      if (
+        name === safe ||
+        name.endsWith(`_${safe}`) ||
+        name === legacy ||
+        name.endsWith(`_${legacy}`) ||
+        name.endsWith(`_${fileName}`)
+      ) {
+        hits.push(path.join(dir, name))
+      }
     }
   }
-  hits.sort((a, b) => stampOf(a) - stampOf(b))
-  return hits[hits.length - 1]
+  hits.sort((a, b) => stampOf(b) - stampOf(a))
+  return hits[0]
 }
 
 function stampOf(filePath: string): number {
@@ -2419,7 +2496,7 @@ function stampOf(filePath: string): number {
 }
 
 function copyIntoCache(cacheDir: string, source: string, fileName: string): void {
-  const dest = path.join(cacheDir, `${Date.now()}_${safeSegment(fileName)}`)
+  const dest = path.join(cacheDir, `${Date.now()}_${safeFileName(fileName)}`)
   if (path.resolve(dest) === path.resolve(source)) return
   fs.copyFileSync(source, dest)
 }
@@ -2443,7 +2520,7 @@ function placeInInbox(inbox: string, source: string, fileName: string): string {
   ensureDir(inbox)
   const resolved = path.resolve(source)
   if (resolved.startsWith(path.resolve(inbox) + path.sep)) return source
-  const dest = path.join(inbox, `${Date.now()}_${safeSegment(fileName)}`)
+  const dest = path.join(inbox, `${Date.now()}_${safeFileName(fileName)}`)
   fs.copyFileSync(source, dest)
   return dest
 }
@@ -2475,10 +2552,15 @@ function expectsAttachedFiles(text: string): boolean {
   return /这两个文件|这两份|这俩个文件|这俩份|那两个文件|刚才的文件|之前的文件|上传的|发的文件|附件|这两个材料/.test(text)
 }
 
+function asksForSpreadsheets(text: string): boolean {
+  if (/生成|制作|做一个|导出成|做成/.test(text) && !/分析|统计|占比|个数/.test(text)) return false
+  return /Excel|excel|xlsx|这三张表|这三个表|这三份表|三张表|三个表/.test(text)
+}
+
 function matchCachedFiles(text: string, files: CachedFile[]): CachedFile[] {
   const named = files.filter((file) => {
     const stem = file.name.replace(/\.[^.]+$/, "")
-    return stem.length >= 4 && text.includes(stem)
+    return text.includes(file.name) || (stem.length >= 2 && text.includes(stem))
   })
   if (named.length > 0) return latestOf(named)
   const generic = /这两个文件|这两份|这俩个文件|这俩份|那两个文件|刚才的文件|之前的文件|上传的文件|发的文件|这些文件|那些文件|上一份|那份文件|附件/.test(text)

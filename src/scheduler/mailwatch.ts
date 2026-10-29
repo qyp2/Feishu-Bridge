@@ -31,16 +31,22 @@ interface MailMessage {
 }
 
 interface SeenFile {
-  mailbox: string
-  ids: string[]
+  mailbox?: string
+  ids?: string[]
+  boxes?: Record<string, string[]>
+}
+
+interface MailTarget {
+  email: string
+  chatId: string
+  ownerOpenId: string
+  bot: string
 }
 
 const API = "https://open.feishu.cn/open-apis"
 const MAX_SEEN = 500
 const MAX_NEW_PER_TICK = 3
 const BODY_CHARS = 1500
-/** Retry delay while the mailbox address has not been provided anywhere yet. */
-const RETRY_NO_MAILBOX_MS = 60_000
 
 /**
  * Polls the user's Feishu mailbox and pushes truly important mail to the chat.
@@ -53,9 +59,8 @@ export class MailWatcher {
   private retryTimer?: NodeJS.Timeout
   private ticking = false
   private tokenCache?: { token: string; expire: number }
-  private seen = new Set<string>()
-  /** True once the inbox baseline was captured (even when it was empty). */
-  private seededOnce = false
+  private readonly seen = new Map<string, Set<string>>()
+  private readonly seeded = new Set<string>()
   private readonly seenFile: string
 
   constructor(private readonly deps: MailWatchDeps) {
@@ -63,40 +68,39 @@ export class MailWatcher {
   }
 
   /**
-   * The address comes from bridge config (admin-set, trusted) or from the
-   * bridge-owned binding store — written ONLY by the bot 「绑定邮箱」 command
-   * after contact-API ownership verification. Nothing on the agent side can
-   * redirect the watcher to someone else's mailbox.
+   * Each subscribed user is polled on their own mailbox and delivered to their
+   * own chat. The config mailbox is only a fallback for the original binding
+   * that has not stored a delivery chat yet.
    */
-  private mailbox(): string {
-    const configured = this.deps.config.mail.mailbox
-    if (configured) return configured
-    return this.deps.binding.get()?.email ?? ""
+  private targets(): MailTarget[] {
+    const out: MailTarget[] = []
+    const covered = new Set<string>()
+    for (const { openId, binding } of this.deps.binding.all()) {
+      if (!binding.chatId || !binding.email) continue
+      covered.add(binding.email.toLowerCase())
+      out.push({
+        email: binding.email,
+        chatId: binding.chatId,
+        ownerOpenId: openId,
+        bot: binding.bot || this.deps.config.mail.bot,
+      })
+    }
+    const mail = this.deps.config.mail
+    if (mail.mailbox && mail.chatId && !covered.has(mail.mailbox.toLowerCase())) {
+      out.push({ email: mail.mailbox, chatId: mail.chatId, ownerOpenId: mail.ownerOpenId, bot: mail.bot })
+    }
+    return out
   }
 
   start(): void {
     const mail = this.deps.config.mail
     if (!mail.enabled || this.timer || this.retryTimer) return
-    if (!mail.chatId) {
-      this.deps.logger.warn("Mail watch enabled but chatId missing; disabled")
-      return
-    }
-    const mailbox = this.mailbox()
-    if (!mailbox) {
-      this.deps.logger.info("Mail watch waiting for a mailbox address (chat config or bridge config)")
-      this.retryTimer = setTimeout(() => {
-        this.retryTimer = undefined
-        this.start()
-      }, RETRY_NO_MAILBOX_MS)
-      this.retryTimer.unref?.()
-      return
-    }
     this.loadSeen()
-    void this.seed().then(() => {
-      this.timer = setInterval(() => void this.tick(), mail.intervalMinutes * 60_000)
-      this.timer.unref?.()
-      this.deps.logger.info("Mail watch started", { mailbox, intervalMinutes: mail.intervalMinutes })
-    })
+    const run = () => void this.tick()
+    this.timer = setInterval(run, mail.intervalMinutes * 60_000)
+    this.timer.unref?.()
+    this.deps.logger.info("Mail watch started", { intervalMinutes: mail.intervalMinutes, targets: this.targets().length })
+    run()
   }
 
   stop(): void {
@@ -106,17 +110,18 @@ export class MailWatcher {
     this.retryTimer = undefined
   }
 
-  /** First run: mark the current inbox as seen so history never floods the chat. */
-  private async seed(): Promise<void> {
-    if (this.seededOnce) return
+  /** First run for a mailbox: mark the current inbox as seen so history never floods the chat. */
+  private async seed(target: MailTarget): Promise<void> {
+    if (this.seeded.has(target.email)) return
     try {
-      const ids = await this.listMessages(20)
-      for (const id of ids) this.seen.add(id)
-      this.seededOnce = true
+      const ids = await this.listMessages(target.email, 20)
+      const box = this.box(target.email)
+      for (const id of ids) box.add(id)
+      this.seeded.add(target.email)
       this.persistSeen()
-      this.deps.audit.record("mailwatch.seeded", { count: ids.length })
+      this.deps.audit.record("mailwatch.seeded", { count: ids.length, mailbox: target.email })
     } catch (error) {
-      this.deps.logger.warn("Mail watch seed failed; will retry next tick", { error: message(error) })
+      this.deps.logger.warn("Mail watch seed failed; will retry next tick", { error: message(error), mailbox: target.email })
     }
   }
 
@@ -124,25 +129,13 @@ export class MailWatcher {
     if (this.ticking) return
     this.ticking = true
     try {
-      // Without a baseline (e.g. permissions were granted after startup) the
-      // whole inbox looks new: seed first and start watching from the next tick.
-      if (!this.seededOnce) {
-        await this.seed()
-        return
+      for (const target of this.targets()) {
+        if (!this.seeded.has(target.email)) {
+          await this.seed(target)
+          continue
+        }
+        await this.tickOne(target)
       }
-      const ids = await this.listMessages(10)
-      const fresh = ids.filter((id) => !this.seen.has(id))
-      // Oldest first, capped so a backlog can never burst-spam the chat.
-      const batch = fresh.reverse().slice(0, MAX_NEW_PER_TICK)
-      for (const id of batch) {
-        this.seen.add(id)
-        await this.triage(id).catch((error) => {
-          this.deps.logger.warn("Mail triage failed", { id, error: message(error) })
-        })
-      }
-      // Known ids from this page stay marked even beyond the batch cap.
-      for (const id of fresh) this.seen.add(id)
-      if (batch.length > 0) this.persistSeen()
     } catch (error) {
       this.deps.logger.warn("Mail watch tick failed", { error: message(error) })
     } finally {
@@ -150,12 +143,26 @@ export class MailWatcher {
     }
   }
 
-  /** Silent agent verdict; a 「高」 line pushes the card, anything else vanishes into audit. */
-  private async triage(id: string): Promise<void> {
-    const mail = this.deps.config.mail
-    const bot = this.deps.conversations.getBot(mail.bot)
+  private async tickOne(target: MailTarget): Promise<void> {
+    const ids = await this.listMessages(target.email, 10)
+    const box = this.box(target.email)
+    const fresh = ids.filter((id) => !box.has(id))
+    const batch = fresh.reverse().slice(0, MAX_NEW_PER_TICK)
+    for (const id of batch) {
+      box.add(id)
+      await this.triage(target, id).catch((error) => {
+        this.deps.logger.warn("Mail triage failed", { id, error: message(error) })
+      })
+    }
+    for (const id of fresh) box.add(id)
+    if (batch.length > 0) this.persistSeen()
+  }
+
+  /** Silent agent verdict; a 「高」 line pushes the card to that user's chat. */
+  private async triage(target: MailTarget, id: string): Promise<void> {
+    const bot = this.deps.conversations.getBot(target.bot)
     if (!bot) return
-    const detail = await this.getMessage(id)
+    const detail = await this.getMessage(target.email, id)
     const starred = detail.label_ids?.includes("IMPORTANT") ? "★" : ""
     const subject = text(detail.subject) || "(无主题)"
     const from = addressList(detail.from)
@@ -178,7 +185,7 @@ export class MailWatcher {
       `正文：${body || "(无正文)"}`,
     ].filter(Boolean).join("\n")
 
-    const reply = await this.deps.conversations.pregenerate(bot, mail.chatId, prompt, undefined, mail.ownerOpenId || undefined)
+    const reply = await this.deps.conversations.pregenerate(bot, target.chatId, prompt, undefined, target.ownerOpenId || undefined)
     const match = /^\[MAIL-IMPORTANCE:(高|中|低)\]\s*(.*)$/m.exec(reply ?? "")
     const level = (match?.[1] ?? "中") as "高" | "中" | "低"
     const reason = (match?.[2] ?? "").trim()
@@ -190,9 +197,9 @@ export class MailWatcher {
     if (from) lines.push(`发件人：${from}`)
     lines.push(`时间：${date}`, `判断：${reason}`, "", summary || "(摘要缺失)")
     const card = markdownCard("📨 重要邮件", lines.join("\n"))
-    const sent = await bot.sendCard(mail.chatId, card)
-    if (mail.ownerOpenId && sent?.messageId) {
-      await bot.urgentApp(sent.messageId, [mail.ownerOpenId]).catch(() => {})
+    const sent = await bot.sendCard(target.chatId, card)
+    if (target.ownerOpenId && sent?.messageId) {
+      await bot.urgentApp(sent.messageId, [target.ownerOpenId]).catch(() => {})
     }
     this.deps.audit.record("mailwatch.pushed", { id, subject })
   }
@@ -222,16 +229,16 @@ export class MailWatcher {
   }
 
   /** The list endpoint returns bare message_id strings, not message objects. */
-  private async listMessages(size: number): Promise<string[]> {
-    const mailbox = encodeURIComponent(this.mailbox())
+  private async listMessages(email: string, size: number): Promise<string[]> {
+    const mailbox = encodeURIComponent(email)
     const data = await this.api(`/mail/v1/user_mailboxes/${mailbox}/messages?page_size=${size}&folder_id=INBOX`)
     return ((data.items as unknown[]) ?? [])
       .map((item) => (typeof item === "string" ? item : (item as MailMessage)?.message_id))
       .filter((id): id is string => Boolean(id))
   }
 
-  private async getMessage(id: string): Promise<MailMessage> {
-    const mailbox = encodeURIComponent(this.mailbox())
+  private async getMessage(email: string, id: string): Promise<MailMessage> {
+    const mailbox = encodeURIComponent(email)
     const data = await this.api(`/mail/v1/user_mailboxes/${mailbox}/messages/${encodeURIComponent(id)}`)
     // The detail payload lives under `message` (older code assumed `item`).
     return ((data.message as MailMessage | undefined) ?? (data.item as MailMessage | undefined) ?? data) as MailMessage
@@ -239,22 +246,35 @@ export class MailWatcher {
 
   // ---- seen-id persistence ---------------------------------------------------
 
+  private box(email: string): Set<string> {
+    let box = this.seen.get(email)
+    if (!box) {
+      box = new Set()
+      this.seen.set(email, box)
+    }
+    return box
+  }
+
   private loadSeen(): void {
     try {
       const data = JSON.parse(fs.readFileSync(this.seenFile, "utf8")) as SeenFile
-      if (data.mailbox === this.mailbox()) {
-        for (const id of data.ids ?? []) if (typeof id === "string" && id) this.seen.add(id)
-        if (this.seen.size > 0) this.seededOnce = true
+      const remember = (email: string, ids: string[] | undefined) => {
+        if (!email) return
+        const box = this.box(email)
+        for (const id of ids ?? []) if (typeof id === "string" && id) box.add(id)
+        if (box.size > 0) this.seeded.add(email)
       }
+      if (data.mailbox) remember(data.mailbox, data.ids)
+      for (const [email, ids] of Object.entries(data.boxes ?? {})) remember(email, ids)
     } catch {
       /* first run */
     }
   }
 
   private persistSeen(): void {
-    const ids = [...this.seen].slice(-MAX_SEEN)
-    const data: SeenFile = { mailbox: this.mailbox(), ids }
-    fs.writeFileSync(this.seenFile, JSON.stringify(data), "utf8")
+    const boxes: Record<string, string[]> = {}
+    for (const [email, ids] of this.seen) boxes[email] = [...ids].slice(-MAX_SEEN)
+    fs.writeFileSync(this.seenFile, JSON.stringify({ boxes }), "utf8")
   }
 }
 
