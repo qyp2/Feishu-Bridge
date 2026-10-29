@@ -25,8 +25,9 @@ if (!command || !fileArg || (command !== "headers" && command !== "count")) {
 
 const resolved = path.resolve(fileArg)
 const normalized = resolved.replace(/\\/g, "/").toLowerCase()
-const allowed =
-  normalized.includes("/feishu_bridge/data/workspaces/") || normalized.includes("/feishu_bridge/data/file-cache/")
+// 检出目录可能叫 feishu_bridge，也可能叫 Feishu-Bridge；只要求落在 bridge 的
+// data/workspaces 或 data/file-cache 下，不锁死仓库本身的命名。
+const allowed = /\/feishu[-_]bridge\/data\/(?:workspaces|file-cache)\//.test(normalized)
 if (!allowed || !resolved.toLowerCase().endsWith(".txt")) fail("只能读取会话里抽出的表格 txt")
 
 let text
