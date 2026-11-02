@@ -1,5 +1,6 @@
 import type { FormField, FormInfo, PermissionRequest } from "../opencode/types.js"
 import type { CronJobInfo } from "../core/commands.js"
+import { PPT_SCENARIOS, findScenarioById } from "../core/scenarios.js"
 import { describeSkill, type Skill, type SkillScope } from "../skills/store.js"
 
 /** A stable marker used to route card callbacks back to the bridge. */
@@ -372,6 +373,8 @@ export interface MakeFormPreset {
   instruction?: string
   template?: string
   cloud?: string
+  /** PPT 场景 id（bp/request/exit），空表示通用。 */
+  scenario?: string
   /** 预选的缓存文件名(value 数组):已勾选 + 新拖入的本地文件。 */
   files?: string[]
 }
@@ -442,6 +445,15 @@ export function makeFormCard(data: MakeFormData, preset?: MakeFormPreset, nonce 
   }
 
   if (data.format === "pptx") {
+    elements.push({ tag: "markdown", content: "**场景**（可选,决定章节结构）" })
+    elements.push(
+      selectStatic(
+        "scenario",
+        "选择场景",
+        [selectOption("通用(按指令自由发挥)", ""), ...PPT_SCENARIOS.map((item) => selectOption(item.label, item.id))],
+        preset?.scenario ?? "",
+      ),
+    )
     const templateOptions = [
       selectOption("不使用模板", ""),
       ...data.personalTemplates.map((name) => selectOption(`【我的】${name}`, name)),
@@ -472,8 +484,16 @@ export function makeFormCard(data: MakeFormData, preset?: MakeFormPreset, nonce 
 }
 
 /** 提交成功后替换表单卡的确认卡。 */
-export function makeSubmittedCard(format: MakeFormat, instruction: string, fileCount: number, template: string): object {
+export function makeSubmittedCard(
+  format: MakeFormat,
+  instruction: string,
+  fileCount: number,
+  template: string,
+  scenario?: string,
+): object {
   const lines = [`指令:${instruction.slice(0, 80)}${instruction.length > 80 ? "…" : ""}`]
+  const scene = findScenarioById(scenario)
+  if (scene) lines.push(`场景:${scene.label}`)
   if (fileCount > 0) lines.push(`资料:${fileCount} 个文件`)
   if (template) lines.push(`模板:${template}`)
   return statusCard(

@@ -7,7 +7,7 @@
 import fs from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { skillDeleteConfirmCard, skillFormCard, skillManageCard, skillSavedCard, welcomeCard, helpCard } from "../dist/feishu/cards.js"
+import { skillDeleteConfirmCard, skillFormCard, skillManageCard, skillSavedCard, welcomeCard, helpCard, makeFormCard, makeSubmittedCard } from "../dist/feishu/cards.js"
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 process.chdir(path.resolve(here, ".."))
@@ -54,6 +54,18 @@ const cards = {
   "删除确认卡": skillDeleteConfirmCard(sample),
   "欢迎卡": welcomeCard(["移动内部汇报"], ["我的周报"]),
   "帮助卡": helpCard(),
+  "PPT 制作表单（通用）": makeFormCard({
+    format: "pptx",
+    files: [{ label: "方案.docx", value: "1700000000000_方案.docx" }],
+    sharedTemplates: ["标准蓝"],
+    personalTemplates: ["我的模板"],
+  }),
+  "PPT 制作表单（场景预选）": makeFormCard(
+    { format: "pptx", files: [], sharedTemplates: [], personalTemplates: [] },
+    { instruction: "做一份 FTTR 家庭组网的产品化请示", scenario: "request" },
+  ),
+  "PPT 已提交卡（含场景）": makeSubmittedCard("pptx", "做一份某产品退出评审 PPT", 2, "标准蓝", "exit"),
+  "Word 制作表单（无场景下拉）": makeFormCard({ format: "docx", files: [], sharedTemplates: [], personalTemplates: [] }),
 }
 
 let failures = 0

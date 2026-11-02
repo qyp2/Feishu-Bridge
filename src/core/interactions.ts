@@ -619,6 +619,7 @@ export class InteractionService {
     const fileKeys = Array.isArray(values.files) ? values.files.map(String).filter((key) => key.length > 0) : []
     const template = String(values.template ?? "").trim()
     const cloud = String(values.cloud ?? "").trim()
+    const scenario = String(values.scenario ?? "").trim() || undefined
     const chat = await bot.getChatInfo(event.chatId).catch(() => undefined)
     const chatType = String((chat as { chatType?: string } | undefined)?.chatType ?? "p2p")
     const result = await this.deps.conversations.submitMake(bot, {
@@ -630,13 +631,14 @@ export class InteractionService {
       fileKeys,
       template,
       cloud,
+      scenario,
     })
     if (!result.ok) {
       await bot.updateCard(event.messageId, statusCard("⚠️ 任务未提交", result.error, "orange"))
       return
     }
     this.deps.conversations.revokeMakeForm(event.chatId, event.operator.openId)
-    await bot.updateCard(event.messageId, makeSubmittedCard(f, instruction, fileKeys.length, template))
+    await bot.updateCard(event.messageId, makeSubmittedCard(f, instruction, fileKeys.length, template, scenario))
   }
 
   private async refreshCronManage(bot: FeishuBot, event: CardActionEvent): Promise<void> {

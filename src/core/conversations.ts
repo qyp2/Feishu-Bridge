@@ -35,6 +35,7 @@ import { fitCardMarkdown, isProgressShell, TurnAccumulator, spinnerFrame, type T
 import { CommandHandler } from "./commands.js"
 import { writeMailScope, type MailBindingStore } from "../mail/binding.js"
 import { renderSkillBlock, SkillStore, type Skill } from "../skills/store.js"
+import { findScenarioById, findScenarioInText, scenarioPromptBlock, type PptScenario } from "./scenarios.js"
 
 export interface SessionContext {
   botName: string
@@ -200,6 +201,35 @@ function menuCommand(text: string): string {
 }
 
 /**
+ * 场景判定：卡片里选的优先，没选就从指令文字里认（「做一份产品化请示PPT」）。
+ * 只有 PPT 用场景，Word/PDF/Excel 一律返回 undefined。
+ */
+export function resolveMakeScenario(input: {
+  instruction: string
+  format: MakeFormat
+  scenario?: string
+}): PptScenario | undefined {
+  if (input.format !== "pptx") return undefined
+  return findScenarioById(input.scenario) ?? findScenarioInText(input.instruction)
+}
+
+/** 表单 → 最终 prompt：指令 + 场景骨架 + 模板 + 输出格式。 */
+export function composeMakePrompt(input: {
+  instruction: string
+  format: MakeFormat
+  template?: string
+  scenario?: string
+}): string {
+  const scene = resolveMakeScenario(input)
+  const parts = [input.instruction]
+  if (scene) parts.push(scenarioPromptBlock(scene))
+  if (input.template) parts.push(`请使用「${input.template}」模板。`)
+  const formatWord = { pptx: "PPT", docx: "Word 文档", pdf: "PDF", xlsx: "Excel 表格", copy: "" }[input.format]
+  if (formatWord) parts.push(`请最终输出 ${formatWord} 文件。`)
+  return parts.join("\n")
+}
+
+/**
  * 固定文字模版订阅（非快捷键、非自由语义）：
  *   订阅 <频率> <时间> <内容>
  *   频率：每天 / 每工作日 / 每周一~日 / 每月N号；时间：24 小时制 9:00、18:30 或 9点30
@@ -354,7 +384,17 @@ export class ConversationService {
     // (images and file/audio/video/sticker tags); the actual files are
     // downloaded and attached separately. Without this a file-only message
     // looks like a text instruction and is sent to the agent right away.
-    const text = menuCommand(stripResourcePlaceholders(rawText))
+    const cleaned = stripResourcePlaceholders(rawText)
+    let text = menuCommand(cleaned)
+    // 「做个产品退出评审的PPT」这类说法：认得出场景就直接开制作表单，
+    // 指令预填原话、场景预选上，用户只补资料即可。
+    if (!text.startsWith("/") && /(ppt|幻灯片|演示文稿)/i.test(cleaned)) {
+      const named = findScenarioInText(cleaned)
+      if (named) {
+        this.stashMakePreset(msg.chatId, msg.senderId, { instruction: cleaned, scenario: named.id })
+        text = "/make ppt"
+      }
+    }
     if (!rawText && msg.resources.length === 0) return
     this.deps.audit.record("feishu.message", {
       bot: bot.name,
@@ -921,6 +961,23 @@ export class ConversationService {
   }
 
   /**
+   * 文字里认出 PPT 场景时，把「原话 + 场景」暂存到这里，等 /make ppt 打开表单时
+   * 当作预设消费掉——这样卡片一出现就是填好的，用户不用再说一遍。
+   */
+  private makePresets = new Map<string, MakeFormPreset>()
+
+  stashMakePreset(chatId: string, openId: string, preset: MakeFormPreset): void {
+    this.makePresets.set(`${chatId}:${openId}`, preset)
+  }
+
+  takeMakePreset(chatId: string, openId: string): MakeFormPreset | undefined {
+    const key = `${chatId}:${openId}`
+    const preset = this.makePresets.get(key)
+    this.makePresets.delete(key)
+    return preset
+  }
+
+  /**
    * 制作表单卡的编号滑动窗口:同一会话只认最新一张卡,但该卡的每次重渲染
    * 都必须换新编号(SDK 对 12h 内相同 payload 的点击去重,不换会被吞)。
    * 校验接受窗口内所有编号——客户端尚未渲染出新卡面时,旧按钮的回调依然
@@ -1017,6 +1074,8 @@ export class ConversationService {
       fileKeys: string[]
       template: string
       cloud: string
+      /** PPT 场景 id；空则由指令文字自动判断。 */
+      scenario?: string
     },
   ): Promise<{ ok: true } | { ok: false; error: string }> {
     const identity: ChatIdentity = {
@@ -1040,10 +1099,9 @@ export class ConversationService {
       if ("error" in cloud) return { ok: false, error: cloud.error }
       files.push({ uri: pathToFileURL(cloud.path).href, name: cloud.name })
     }
-    const parts = [input.instruction]
-    if (input.template) parts.push(`请使用「${input.template}」模板。`)
-    const formatWord = { pptx: "PPT", docx: "Word 文档", pdf: "PDF", xlsx: "Excel 表格", copy: "" }[input.format]
-    if (formatWord) parts.push(`请最终输出 ${formatWord} 文件。`)
+    // 场景：卡片选中的优先；没选就从指令文字里认（「做一份产品化请示PPT」）。
+    const scene = resolveMakeScenario(input)
+    const text = composeMakePrompt({ ...input, scenario: scene?.id })
     this.deps.audit.record("make.submitted", {
       bot: bot.name,
       chatId: input.chatId,
@@ -1051,12 +1109,13 @@ export class ConversationService {
       files: files.length,
       template: input.template || undefined,
       cloud: input.cloud ? true : undefined,
+      scenario: scene?.label,
       operator: input.senderId,
     })
     await this.runTurn({
       bot,
       binding,
-      text: parts.join("\n"),
+      text,
       files,
       source: "user",
       userOpenId: input.senderId,

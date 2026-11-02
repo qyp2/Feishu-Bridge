@@ -233,8 +233,9 @@ export class CommandHandler {
           return true
         }
         const data = this.conversations.makeFormData(identity.chatId, identity.senderId, format)
+        const preset = this.conversations.takeMakePreset(identity.chatId, identity.senderId)
         const nonce = this.conversations.issueMakeForm(identity.chatId, identity.senderId)
-        await bot.sendCard(identity.chatId, makeFormCard(data, undefined, nonce), { replyTo: msg.messageId, mentions: mentionsFor(identity.chatType, identity.senderId, identity.senderName) })
+        await bot.sendCard(identity.chatId, makeFormCard(data, preset, nonce), { replyTo: msg.messageId, mentions: mentionsFor(identity.chatType, identity.senderId, identity.senderName) })
         return true
       }
       case "templates": {
