@@ -323,6 +323,8 @@ export class InteractionService {
       await this.resolveCronEdit(bot, event, value.d)
     } else if (value.k === "cron-mgr") {
       await this.refreshCronManage(bot, event)
+    } else if (value.k === "menu" && value.d) {
+      await this.resolveMenuAction(bot, event, value.d)
     } else if (value.k === "make-form" && value.f) {
       await this.resolveMakeForm(bot, event, value.f, value.d)
     } else if (value.k === "make-sub" && value.f) {
@@ -371,6 +373,20 @@ export class InteractionService {
           name: value.s,
         })
       }
+    }
+  }
+
+  private async resolveMenuAction(bot: FeishuBot, event: CardActionEvent, action: string): Promise<void> {
+    if (action === "cron-sub") {
+      await bot.updateCard(event.messageId, subscribeCard())
+      return
+    }
+    if (action === "cron-mail-sub") {
+      await bot.updateCard(event.messageId, mailSubscribeCard())
+      return
+    }
+    if (action === "cron-mgr") {
+      await this.refreshCronManage(bot, event)
     }
   }
 

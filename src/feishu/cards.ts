@@ -65,6 +65,14 @@ function buttonRow(buttons: object[]): object {
   }
 }
 
+function subscriptionQuickRow(nonce = nextFormNonce()): object {
+  return buttonRow([
+    callbackButton("📰 资讯订阅", { n: nonce, k: "menu", d: "cron-sub" }, "primary"),
+    callbackButton("📮 邮件订阅", { n: nonce, k: "menu", d: "cron-mail-sub" }),
+    callbackButton("📋 我的订阅", { n: nonce, k: "menu", d: "cron-mgr" }),
+  ])
+}
+
 export function escapeMarkdown(text: string): string {
   return text.replace(/([\\`*_{}[\]()#+\-.!|>])/g, "\\$1")
 }
@@ -367,6 +375,9 @@ export function welcomeCard(sharedTemplates: string[], personalTemplates: string
       tag: "markdown",
       content: `**模板库**\n${templateLine}\n\n**我的技能**\n把你的做法攒成技能：说「技能」打开管理卡片，点「新建技能」填触发词与步骤，以后提到触发词就自动照做。\n\n**小提示**：从菜单打开「商业计划书」「产品化请示」或「产品退出评审」，在卡片里填指令；要套版式时再在「模板」里选择。点击下方菜单「帮助」查看使用说明。`,
     },
+    { tag: "hr" },
+    { tag: "markdown", content: "**订阅快捷入口**" },
+    subscriptionQuickRow(),
   ])
 }
 
@@ -1168,7 +1179,11 @@ export function cronFormCancelCard(editingName?: string, menuLabel?: string): ob
   const content = editingName
     ? `已取消编辑，**${escapeMarkdown(editingName)}** 保持原样不变。\n管理订阅：点击下方菜单「订阅 > 我的订阅」。`
     : `已取消，没有创建订阅。\n想重新开始：点击下方菜单「订阅 > ${menuLabel ?? "资讯订阅"}」。`
-  return statusCard("已取消", content, "grey")
+  return baseCard("已取消", "grey", [
+    { tag: "markdown", content },
+    { tag: "hr" },
+    subscriptionQuickRow(),
+  ])
 }
 
 /** 订阅管理卡：按「邮件订阅 / 资讯订阅」分组，列表 + 暂停/编辑/删除，全部点选操作。 */
@@ -1222,6 +1237,7 @@ export function cronManageCard(jobs: CronJobInfo[]): object {
     content: "<font color='grey'>点击菜单「订阅 > 资讯订阅」或「订阅 > 邮件订阅」新建订阅 · 操作后列表即时刷新</font>",
     text_size: "notation",
   })
+  elements.push(subscriptionQuickRow())
   return baseCard("📋 我的订阅", "blue", elements)
 }
 
@@ -1469,5 +1485,8 @@ export function helpCard(): object {
     { tag: "markdown", content: "我可以把你的消息转发给产品中心智能助手，并实时流式回复。\n\n**支持：**\n- 文本、图片、文件（图片/文本会作为上下文附件）\n- 交互式卡片授权与提问\n- 每个会话独立目录，上下文互不干扰\n- 定时任务、会话迁移" },
     { tag: "hr" },
     { tag: "markdown", content: commands.map((c) => `- ${c}`).join("\n") },
+    { tag: "hr" },
+    { tag: "markdown", content: "**订阅快捷入口**" },
+    subscriptionQuickRow(),
   ])
 }
