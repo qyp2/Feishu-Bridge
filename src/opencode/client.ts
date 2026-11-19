@@ -171,9 +171,15 @@ export class OpencodeClient {
 
   // ---- prompting ----------------------------------------------------------
 
-  async prompt(sessionID: string, input: PromptInput): Promise<{ id: string }> {
+  async prompt(
+    sessionID: string,
+    input: PromptInput,
+    options?: { documentNote?: string; inlineDocuments?: boolean },
+  ): Promise<{ id: string }> {
     // Parse saved office files only while handling an instruction. Upload itself only stores them.
-    const note = await describeDocuments(input.files)
+    const note =
+      options?.documentNote ??
+      (await describeDocuments(input.files, { inlineDocuments: options?.inlineDocuments }))
     const prepared = encodePromptFiles(`${input.text}${note}`, input.files)
     return this.data("POST", `/api/session/${sessionID}/prompt`, {
       body: { ...input, text: prepared.text, files: prepared.files },
@@ -316,7 +322,10 @@ function encodePromptFiles(
 ): { text: string; files?: ApiPromptFile[] } {
   const images: ApiPromptFile[] = []
   for (const file of files ?? []) {
-    const filePath = file.uri.startsWith("file:") ? fileURLToPath(file.uri) : file.uri
+    const uri = file.uri?.trim()
+    if (!uri) continue
+    const filePath = uri.startsWith("file:") ? fileURLToPath(uri) : uri
+    if (!fs.existsSync(filePath)) continue
     const ext = path.extname(file.name ?? filePath).toLowerCase()
     if (!IMAGE_EXT.has(ext)) continue
     // 统一成 file:// URL：路径里的空格会被百分号编码，服务端才认。

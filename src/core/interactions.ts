@@ -2,14 +2,21 @@ import type { CardActionEvent } from "@larksuiteoapi/node-sdk"
 import type { OpencodeClient } from "../opencode/client.js"
 import type { FormField, FormInfo, FormValue, PermissionRequest } from "../opencode/types.js"
 import type { AuditLog, Logger } from "../util/logger.js"
-import { bindCardOwner, mentionsFor, type FeishuBot } from "../feishu/bot.js"
+import { bindCardOwner, mentionsFor, stageCardToast, type FeishuBot } from "../feishu/bot.js"
+import { extractFormValues, formFieldString, formStringList, formValueKeySummary } from "../feishu/formValues.js"
 import type { ChatIdentity, ConversationService, SessionContext } from "./conversations.js"
 import { buildMailDigestPrompt, lookupUserEmail, type CronController, type CronJobInfo } from "./commands.js"
-import { cronDeleteConfirmCard, cronFormCancelCard, cronManageCard, formCard, isMailJob, loginCard, loginDoneCard, mailJobName, mailSubscribeCard, makeFormCard, makeSubmittedCard, permissionCard, skillDeleteConfirmCard, skillFormCard, skillManageCard, skillSavedCard, statusCard, studioCard, studioPendingCard, studioResultCard, subscribeCard, type CardValue, type SkillFormDraft, type StudioDraft, type StudioKind } from "../feishu/cards.js"
+import { buildProductContextPrompt, detectProductContext } from "./product-context.js"
+import { cronDeleteConfirmCard, cronFormCancelCard, cronManageCard, formCard, isMailJob, loginCard, loginDoneCard, mailJobName, mailSubscribeCard, MAKE_FORM_FILE_PLACEHOLDER, makeFormCard, makeSubmittedCard, parseDeckTask, permissionCard, skillDeleteConfirmCard, skillFormCard, skillManageCard, skillSavedCard, statusCard, studioCard, studioPendingCard, studioResultCard, subscribeCard, type CardValue, type DeckTask, type MakeFormat, type MakeFormData, type MakeFormPreset, type SkillFormDraft, type StudioDraft, type StudioKind } from "../feishu/cards.js"
 import { CONFIG_CHANGE_DENIED, isProtectedConfigTarget } from "./configGuard.js"
+import type { IntelArchiveStore } from "../intel/archive.js"
+import { intelDigestCard, intelToast } from "../intel/cards.js"
+import { intelActionPrompt, type IntelScene } from "../intel/prompts.js"
 import { parseTriggers, type SkillDraft } from "../skills/store.js"
 import { KeyedSerial } from "../util/async.js"
 import type { MailBindingStore } from "../mail/binding.js"
+import { StudioApiError } from "../studio/client.js"
+import type { StudioService } from "../studio/service.js"
 
 /** 订阅表单的频率 option value 映射到 cron 的日/周字段 */
 const FREQ_TABLE: Record<string, { dom: string; dow: string }> = {
@@ -65,7 +72,10 @@ export interface InteractionDeps {
   ) => Promise<void>
   /** Lazily resolve the cron controller (it is constructed after this service). */
   getCron?: () => CronController | undefined
+  getIntel?: () => IntelArchiveStore | undefined
   getMailBinding?: () => MailBindingStore | undefined
+  /** 创作工作台 / 验证码登录（玉树 OpenAPI）；未注入时保持预览行为。 */
+  studio?: StudioService
 }
 
 /**
@@ -81,6 +91,8 @@ export class InteractionService {
   private readonly sessionsWithPermission = new Set<string>()
   private readonly actionSerial = new KeyedSerial()
   private readonly smsSentAt = new Map<string, number>()
+  /** 校验失败后卡片回填与服务端合并，避免飞书只回传部分 form_value。 */
+  private readonly pendingSkillForms = new Map<string, SkillFormDraft>()
   private timer?: NodeJS.Timeout
   private polling = false
 
@@ -130,13 +142,13 @@ export class InteractionService {
     if (!bot) return
 
     try {
-      const permissions = await client.pendingPermissions(sessionID)
+      let permissions = await client.pendingPermissions(sessionID)
+      if (context.turnSource === "cron" && permissions.length > 0) {
+        await this.autoGrantCronPermissions(client, context, permissions)
+        permissions = await client.pendingPermissions(sessionID).catch(() => [])
+      }
       if (permissions.length > 0) this.sessionsWithPermission.add(sessionID)
       else this.sessionsWithPermission.delete(sessionID)
-      const currentIds = new Set(permissions.map((p) => p.id))
-      for (const id of [...this.handledPermissions]) {
-        if (!currentIds.has(id)) this.handledPermissions.delete(id)
-      }
       for (const request of permissions) {
         if (this.handledPermissions.has(request.id)) continue
         this.handledPermissions.add(request.id)
@@ -158,6 +170,28 @@ export class InteractionService {
       }
     } catch (error) {
       this.deps.logger.debug("Form poll failed", { sessionID, error: message(error) })
+    }
+  }
+
+  /** Cron / mail pregen runs unattended: approve all tool paths except protected bridge config. */
+  private async autoGrantCronPermissions(
+    client: OpencodeClient,
+    context: SessionContext,
+    permissions: PermissionRequest[],
+  ): Promise<void> {
+    for (const request of permissions) {
+      if (this.handledPermissions.has(request.id)) continue
+      this.handledPermissions.add(request.id)
+      const reject = request.resources.some((resource) => isProtectedConfigTarget(resource))
+      const decision = reject ? "reject" : "always"
+      await client.replyPermission(request.sessionID, request.id, decision).catch(() => {})
+      this.deps.audit.record("permission.auto", {
+        sessionID: request.sessionID,
+        requestID: request.id,
+        action: request.action,
+        decision,
+        chatId: context.chatId,
+      })
     }
   }
 
@@ -224,13 +258,21 @@ export class InteractionService {
   // ---- card callbacks -----------------------------------------------------
 
   async handleCardAction(bot: FeishuBot, event: CardActionEvent): Promise<void> {
-    const value = event.action.value as CardValue | undefined
-    if (!value || typeof value !== "object" || !("k" in value)) return
+    const value = parseCardCallbackValue(event.action.value)
+    if (!value) return
+    if (value.k === "intel") {
+      if (value.o && event.operator.openId !== value.o) {
+        stageCardToast("这张卡片只有发起人可以操作。", "warning")
+        return
+      }
+      const toast = intelToast(value.d)
+      stageCardToast(toast.content, toast.type)
+    }
     // Acknowledge Feishu immediately. The SDK only sends the card-callback
     // response after this method resolves, and Feishu times out at about 3s.
     // Replying to OpenCode and patching the card can exceed that, so the work
     // runs off the critical path, serialized per card so rapid clicks don't race.
-    const key = `${event.messageId}:${value.k}:${value.f ?? value.r ?? value.d ?? ""}`
+    const key = `${event.messageId}:${value.k}:${value.n ?? ""}:${value.f ?? value.r ?? value.d ?? ""}`
     void this.actionSerial
       .run(key, async () => {
         if (value.o && event.operator.openId !== value.o) {
@@ -282,13 +324,15 @@ export class InteractionService {
     } else if (value.k === "cron-mgr") {
       await this.refreshCronManage(bot, event)
     } else if (value.k === "make-form" && value.f) {
-      await this.resolveMakeForm(bot, event, value.f)
+      await this.resolveMakeForm(bot, event, value.f, value.d)
     } else if (value.k === "make-sub" && value.f) {
-      await this.resolveMakeSubmit(bot, event, value.f, value.n)
+      await this.resolveMakeSubmit(bot, event, value.f, value.n, value.d)
     } else if (value.k === "make-refresh" && value.f) {
-      await this.resolveMakeRefresh(bot, event, value.f, value.n)
+      await this.resolveMakeRefresh(bot, event, value.f, value.n, value.d)
     } else if (value.k === "make-addfile" && value.f) {
-      await this.resolveMakeAddFile(bot, event, value.f, value.n)
+      await this.resolveMakeAddFile(bot, event, value.f, value.n, value.d, "material")
+    } else if (value.k === "make-addtpl" && value.f) {
+      await this.resolveMakeAddFile(bot, event, value.f, value.n, value.d, "template")
     } else if (value.k === "make-cancel") {
       await this.resolveMakeCancel(bot, event, value.n)
     } else if (value.k === "studio") {
@@ -312,21 +356,34 @@ export class InteractionService {
     } else if (value.k === "skill-save") {
       await this.resolveSkillSave(bot, event, value)
     } else if (value.k === "skill-cancel") {
+      this.pendingSkillForms.delete(event.messageId)
       await this.refreshSkillManage(bot, event, "已取消，技能没有改动。")
     } else if (value.k === "skill-use" && value.d) {
       await this.resolveSkillUse(bot, event, value.d)
+    } else if (value.k === "intel") {
+      if (value.d && value.f && value.s) {
+        await this.resolveIntel(bot, event, value.d, value.f, value.s)
+      } else {
+        this.deps.audit.record("intel.stale", {
+          reason: "incomplete_callback",
+          action: value.d,
+          itemId: value.f,
+          name: value.s,
+        })
+      }
     }
   }
 
-  /** 验证码登录预览：校验格式并改卡片。同一飞书账号 60 秒内只能点一次获取验证码。 */
+  /** 验证码登录：对接玉树 OpenAPI；未注入 studio 时保持本地校验提示。 */
   private async resolveLogin(bot: FeishuBot, event: CardActionEvent, value: CardValue): Promise<void> {
     const form = extractFormValues(event)
     const phone = textOf(form.phone).replace(/\s+/g, "")
     const code = textOf(form.code).trim()
     const draft = { phone, code }
+    const studio = this.deps.studio
     if (value.d === "sms") {
-      if (!/^1\d{10}$/.test(phone)) {
-        await bot.updateCard(event.messageId, loginCard({ ...draft, notice: "请输入 11 位手机号。" }))
+      if (!phone) {
+        await bot.updateCard(event.messageId, loginCard({ ...draft, notice: "请输入手机号。" }))
         return
       }
       const last = this.smsSentAt.get(event.operator.openId) ?? 0
@@ -335,22 +392,83 @@ export class InteractionService {
         await bot.updateCard(event.messageId, loginCard({ ...draft, sent: true, notice: `请 ${Math.ceil(wait / 1000)} 秒后再获取验证码。` }))
         return
       }
-      this.smsSentAt.set(event.operator.openId, Date.now())
-      await bot.updateCard(event.messageId, loginCard({ ...draft, sent: true, notice: "验证码已发送。预览不会真的发短信，任意 6 位数字都可以登录。" }))
+      if (!studio) {
+        await bot.updateCard(event.messageId, loginCard({ ...draft, notice: "创作登录服务未启用。" }))
+        return
+      }
+      try {
+        await studio.sendSms(phone)
+        this.smsSentAt.set(event.operator.openId, Date.now())
+        await bot.updateCard(event.messageId, loginCard({ ...draft, sent: true, notice: "验证码已发送，请查收短信。" }))
+      } catch (error) {
+        await bot.updateCard(event.messageId, loginCard({ ...draft, notice: studioErrorMessage(error) }))
+      }
       return
     }
-    if (!/^1\d{10}$/.test(phone)) {
-      await bot.updateCard(event.messageId, loginCard({ ...draft, notice: "请输入 11 位手机号。" }))
+    if (!studio) {
+      await bot.updateCard(event.messageId, loginCard({ ...draft, notice: "创作登录服务未启用。" }))
       return
     }
-    if (!/^\d{6}$/.test(code)) {
-      await bot.updateCard(event.messageId, loginCard({ ...draft, notice: "请输入 6 位验证码。" }))
-      return
+    try {
+      const { account, me } = await studio.login(event.operator.openId, phone, code)
+      this.deps.audit.record("studio.login", { openId: event.operator.openId, mobile: account.mobile })
+      const pending = studio.takePending(event.operator.openId)
+      const points = typeof me.points === "number" ? me.points : undefined
+      if (!pending) {
+        await bot.updateCard(event.messageId, loginDoneCard(account.mobile, points))
+        return
+      }
+      // 从「海报生成」等入口进来的：登录后继续引导描述，或已有描述则直接生成。
+      const nextHint =
+        pending.kind === "poster"
+          ? pending.prompt
+            ? "登录成功，正在按你刚才的描述生成海报…"
+            : "登录成功，请在下一张卡片填写海报描述并开始生成。"
+          : "登录成功，请继续填写创作内容。"
+      await bot.updateCard(event.messageId, loginDoneCard(account.mobile, points, nextHint))
+      const filled: StudioDraft = {
+        kind: pending.kind,
+        prompt: pending.prompt,
+        loggedIn: true,
+        points,
+        notice:
+          pending.kind === "poster" && !pending.prompt
+            ? "已登录。请填写海报描述，然后点「开始生成」。"
+            : undefined,
+      }
+      if (pending.kind === "poster" && pending.prompt?.trim()) {
+        await bot.sendCard(event.chatId, studioPendingCard(), { replyTo: event.messageId })
+        try {
+          const outcome = await studio.run(event.operator.openId, filled)
+          const failed = String(outcome.job.status || "") === "failed"
+          await bot.sendCard(
+            event.chatId,
+            studioResultCard(filled, {
+              text: outcome.job.text,
+              imageUrls: (outcome.job.images ?? []).map((item) => item.url).filter(Boolean),
+              pointsLeft: outcome.pointsLeft,
+              dryRun: outcome.job.dry_run,
+              error: failed ? outcome.job.message || "生成失败，请稍后重试。" : undefined,
+            }),
+            { replyTo: event.messageId },
+          )
+          for (const file of outcome.imageFiles) {
+            await bot.sendImage(event.chatId, file, { replyTo: event.messageId }).catch(() => {})
+          }
+        } catch (error) {
+          await bot.sendCard(event.chatId, studioResultCard(filled, { error: studioErrorMessage(error) }), {
+            replyTo: event.messageId,
+          })
+        }
+        return
+      }
+      await bot.sendCard(event.chatId, studioCard(filled), { replyTo: event.messageId })
+    } catch (error) {
+      await bot.updateCard(event.messageId, loginCard({ ...draft, notice: studioErrorMessage(error) }))
     }
-    await bot.updateCard(event.messageId, loginDoneCard(phone))
   }
 
-  /** 创作工作台预览：切换功能、回填已填内容，开始生成只改这张卡片。 */
+  /** 创作工作台：切换功能 / 提交玉树任务并回写结果。 */
   private async resolveStudio(bot: FeishuBot, event: CardActionEvent, value: CardValue): Promise<void> {
     const saved = studioDraftFrom(value)
     const form = extractFormValues(event)
@@ -365,7 +483,8 @@ export class InteractionService {
     const tone = textOf(form.tone) || saved.tone || "广东粤语"
     const picked = value.d === "copy" || value.d === "poster" || value.d === "commerce" ? value.d : undefined
     const kind: StudioKind = picked ?? (value.f === "poster" || value.f === "commerce" || value.f === "copy" ? value.f : "copy")
-    const filled = { kind, prompt, product, channel, language, words, scene, selling, platform, tone }
+    const auth = await this.studioAuthDraft(event.operator.openId)
+    const filled: StudioDraft = { kind, prompt, product, channel, language, words, scene, selling, platform, tone, ...auth }
     if (value.d === "revise") {
       await bot.updateCard(event.messageId, studioCard({ ...filled, kind: "copy" }))
       return
@@ -394,9 +513,75 @@ export class InteractionService {
       await bot.updateCard(event.messageId, studioCard({ ...filled, notice: "请先填写描述。" }))
       return
     }
+    const studio = this.deps.studio
+    if (!studio) {
+      await bot.updateCard(event.messageId, studioCard({ ...filled, notice: "创作服务未启用。" }))
+      return
+    }
+    if (!studio.account(event.operator.openId)) {
+      await bot.updateCard(event.messageId, studioCard({ ...filled, notice: "尚未登录。请先发送「验证码登录」绑定网页端账号。" }))
+      return
+    }
     await bot.updateCard(event.messageId, studioPendingCard())
-    await new Promise((resolve) => setTimeout(resolve, 1200))
-    await bot.updateCard(event.messageId, studioResultCard(filled))
+    try {
+      const outcome = await studio.run(event.operator.openId, filled)
+      const status = String(outcome.job.status || "")
+      if (status === "failed") {
+        await bot.updateCard(
+          event.messageId,
+          studioResultCard(filled, {
+            error: outcome.job.message || "生成失败，请稍后重试。",
+            pointsLeft: outcome.pointsLeft,
+            dryRun: outcome.job.dry_run,
+          }),
+        )
+        this.deps.audit.record("studio.job_failed", { openId: event.operator.openId, kind, jobId: outcome.job.job_id })
+        return
+      }
+      const imageUrls = (outcome.job.images ?? []).map((item) => item.url).filter(Boolean)
+      await bot.updateCard(
+        event.messageId,
+        studioResultCard(filled, {
+          text: outcome.job.text,
+          imageUrls,
+          pointsLeft: outcome.pointsLeft,
+          dryRun: outcome.job.dry_run,
+        }),
+      )
+      for (const file of outcome.imageFiles) {
+        await bot.sendImage(event.chatId, file, { replyTo: event.messageId }).catch((error) => {
+          this.deps.logger.warn("Failed to send studio image", {
+            error: error instanceof Error ? error.message : String(error),
+          })
+        })
+      }
+      this.deps.audit.record("studio.job_ok", {
+        openId: event.operator.openId,
+        kind,
+        jobId: outcome.job.job_id,
+        images: outcome.imageFiles.length,
+        dryRun: outcome.job.dry_run,
+      })
+    } catch (error) {
+      await bot.updateCard(event.messageId, studioResultCard(filled, { error: studioErrorMessage(error) }))
+      this.deps.audit.record("studio.job_error", {
+        openId: event.operator.openId,
+        kind,
+        error: studioErrorMessage(error),
+      })
+    }
+  }
+
+  private async studioAuthDraft(openId: string): Promise<Pick<StudioDraft, "points" | "loggedIn">> {
+    const studio = this.deps.studio
+    if (!studio?.account(openId)) return { loggedIn: false }
+    try {
+      const me = await studio.me(openId)
+      if (!me) return { loggedIn: false }
+      return { loggedIn: true, points: typeof me.points === "number" ? me.points : undefined }
+    } catch {
+      return { loggedIn: true }
+    }
   }
 
   // ---- 个性化技能 ----------------------------------------------------------
@@ -454,21 +639,15 @@ export class InteractionService {
   private async resolveSkillSave(bot: FeishuBot, event: CardActionEvent, value: CardValue): Promise<void> {
     const openId = event.operator.openId
     const isAdmin = this.deps.conversations.isSkillAdmin(openId)
+    const cached = this.pendingSkillForms.get(event.messageId)
     const values = extractFormValues(event)
-    const draft: SkillDraft = {
-      id: value.d,
-      name: String(values.name ?? "").trim(),
-      triggers: parseTriggers(String(values.triggers ?? "")),
-      scene: String(values.scene ?? "").trim(),
-      steps: String(values.steps ?? "").trim(),
-      output: String(values.output ?? "").trim(),
-      scope: String(values.scope ?? "") === "shared" ? "shared" : "personal",
-    }
+    const draft: SkillDraft = mergeSkillDraftFromForm(cached, values, value.d ?? cached?.id)
     try {
       const skill = this.deps.conversations.skills.save(openId, draft, {
         allowShared: isAdmin,
         ownerName: event.operator.name,
       })
+      this.pendingSkillForms.delete(event.messageId)
       this.deps.audit.record("skill.saved", {
         chatId: event.chatId,
         operator: openId,
@@ -476,16 +655,49 @@ export class InteractionService {
         scope: skill.scope,
         updated: Boolean(draft.id),
       })
-      await bot.updateCard(event.messageId, skillSavedCard(skill, isAdmin))
+      try {
+        await bot.updateCard(event.messageId, skillSavedCard(skill, isAdmin))
+      } catch {
+        await bot
+          .sendMarkdown(
+            event.chatId,
+            `✅ 技能「${skill.name}」已保存。若上方卡片未刷新，请发「技能库」查看。`,
+            { replyTo: event.messageId },
+          )
+          .catch(() => {})
+      }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
-      // 不替换卡片：表单原样留在聊天里，用户改掉出问题的那一格再提交即可。
-      this.deps.audit.record("skill.rejected", { chatId: event.chatId, operator: openId, reason })
+      this.deps.audit.record("skill.rejected", {
+        chatId: event.chatId,
+        operator: openId,
+        reason,
+        formKeys: formValueKeySummary(event),
+        nameLen: draft.name.length,
+      })
+      // 必须刷新卡片（新 nonce），否则同一张卡第二次点「保存」会被 SDK 去重静默丢弃。
+      const draftForForm: SkillFormDraft = {
+        id: draft.id,
+        name: draft.name,
+        triggers: draft.triggers,
+        scene: draft.scene,
+        steps: draft.steps,
+        output: draft.output,
+        scope: draft.scope,
+      }
+      this.pendingSkillForms.set(event.messageId, draftForForm)
       await bot
-        .sendMarkdown(event.chatId, `⚠️ 没有保存：${reason}\n改好后在这张卡片上重新提交即可。`, {
-          replyTo: event.messageId,
+        .updateCard(
+          event.messageId,
+          skillFormCard(draftForForm, { isAdmin, errorHint: reason }),
+        )
+        .catch(async () => {
+          await bot
+            .sendMarkdown(event.chatId, `⚠️ 没有保存：${reason}\n请发「新建技能」重新打开表单。`, {
+              replyTo: event.messageId,
+            })
+            .catch(() => {})
         })
-        .catch(() => {})
     }
   }
 
@@ -521,11 +733,12 @@ export class InteractionService {
 
   /** A make-form is single-use: any action on a superseded card gets this notice. */
   private async rejectStaleMakeForm(bot: FeishuBot, event: CardActionEvent): Promise<void> {
+    this.deps.conversations.noteMakeFailure(event.chatId, event.operator.openId, event.messageId)
     await bot.updateCard(
       event.messageId,
       statusCard(
         "⏳ 表单已失效",
-        "这张表单已被取代:你之后发起了其他任务,或打开了新的制作表单。\n如需制作,请从菜单「制作 > 文档制作」重新打开。",
+        "这张表单已被取代:你之后发起了其他任务,或打开了新的制作表单。\n如需制作,请从菜单重新打开「商业计划书」「产品化请示」或「产品退出评审」。",
         "grey",
       ),
     )
@@ -534,7 +747,14 @@ export class InteractionService {
   /**
    * 「添加本地文件」:记下当前表单输入,请用户用原生「+ → 本机文件」发文件;
    * 文件到达后表单卡自动重渲染(已填内容回填、新文件自动勾选),无需手动刷新。 */
-  private async resolveMakeAddFile(bot: FeishuBot, event: CardActionEvent, format: string, nonce?: number): Promise<void> {
+  private async resolveMakeAddFile(
+    bot: FeishuBot,
+    event: CardActionEvent,
+    format: string,
+    nonce?: number,
+    deckRaw?: string,
+    accept: "material" | "template" = "material",
+  ): Promise<void> {
     const f = format === "pptx" || format === "docx" || format === "pdf" || format === "xlsx" || format === "copy" ? format : undefined
     if (!f) return
     if (!this.deps.conversations.makeFormActive(event.chatId, event.operator.openId, nonce)) {
@@ -542,65 +762,128 @@ export class InteractionService {
       return
     }
     const values = extractFormValues(event)
-    this.deps.conversations.beginMakeUpload(event.chatId, event.operator.openId, event.messageId, f, {
-      instruction: String(values.instruction ?? "").trim() || undefined,
-      template: String(values.template ?? "").trim() || undefined,
-      cloud: String(values.cloud ?? "").trim() || undefined,
-      files: Array.isArray(values.files) ? values.files.map(String) : undefined,
-    })
-    await bot
-      .sendMarkdown(
-        event.chatId,
-        "请点输入框左侧 **+ → 本机文件**,选好文件发送(可多选)。收到后表单会自动更新并勾选,已填写的指令不会丢。",
-        { replyTo: event.messageId },
-      )
-      .catch(() => {})
+    const chatType = await this.makeChatType(bot, event.chatId)
+    const deck = this.deckOf(f, deckRaw)
+    this.deps.conversations.beginMakeUpload(
+      event.chatId,
+      event.operator.openId,
+      event.messageId,
+      f,
+      {
+        instruction: String(values.instruction ?? "").trim() || undefined,
+        template: String(values.template ?? "").trim() || undefined,
+        cloud: String(values.cloud ?? "").trim() || undefined,
+        files: formStringList(values.files)?.filter((key) => key !== MAKE_FORM_FILE_PLACEHOLDER),
+      },
+      chatType,
+      accept,
+      deck,
+    )
+    const hint =
+      accept === "template"
+        ? "请点输入框左侧 **+ → 本机文件**，发送 .pptx 背景模板（可多份）。收到后只出现在卡片「模板」下拉里，并自动选中最新一份，不会进入资料文件。已填写的指令不会丢。"
+        : "请点输入框左侧 **+ → 本机文件**,选好文件发送(可多选)。收到后表单会自动更新并勾选,已填写的指令不会丢。"
+    await bot.sendMarkdown(event.chatId, hint, { replyTo: event.messageId }).catch(() => {})
+  }
+
+  private deckOf(format: string, raw: string | undefined): DeckTask | undefined {
+    if (format !== "pptx") return undefined
+    return parseDeckTask(raw) ?? "business-plan"
   }
 
   /**
    * 「刷新文件列表」:带着当前表单输入重渲染——已填内容回填,刚拖进聊天的
    * 新文件(近 2 分钟入缓存)自动勾选,免去找回的麻烦。 */
-  private async resolveMakeRefresh(bot: FeishuBot, event: CardActionEvent, format: string, nonce?: number): Promise<void> {
+  private async resolveMakeRefresh(bot: FeishuBot, event: CardActionEvent, format: string, nonce?: number, deckRaw?: string): Promise<void> {
     const f = format === "pptx" || format === "docx" || format === "pdf" || format === "xlsx" || format === "copy" ? format : undefined
     if (!f) return
     if (!this.deps.conversations.makeFormActive(event.chatId, event.operator.openId, nonce)) {
       await this.rejectStaleMakeForm(bot, event)
       return
     }
+    const chatType = await this.makeChatType(bot, event.chatId)
+    const deck = this.deckOf(f, deckRaw)
     const values = extractFormValues(event)
-    const data = this.deps.conversations.makeFormData(event.chatId, event.operator.openId, f)
-    const checked = new Set(Array.isArray(values.files) ? values.files.map(String) : [])
+    let data = this.deps.conversations.makeFormData(bot, event.chatId, event.operator.openId, f, chatType, deck)
+    const checked = new Set(formStringList(values.files)?.filter((key) => key !== MAKE_FORM_FILE_PLACEHOLDER) ?? [])
     const now = Date.now()
     for (const file of data.files) {
       const savedAt = Number(/^(\d+)_/.exec(file.value)?.[1] ?? 0)
-      if (savedAt > 0 && now - savedAt < 2 * 60_000) checked.add(file.value)
+      if (savedAt > 0 && now - savedAt < 60 * 60_000) checked.add(file.value)
     }
-    await bot.updateCard(
+    let preset = {
+      instruction: String(values.instruction ?? "").trim() || undefined,
+      template: String(values.template ?? "").trim() || undefined,
+      cloud: String(values.cloud ?? "").trim() || undefined,
+      files: [...checked].filter((key) => data.files.some((file) => file.value === key)),
+    }
+    this.deps.conversations.rememberMakeFormCard(
+      event.chatId,
+      event.operator.openId,
       event.messageId,
-      makeFormCard(
-        data,
-        {
-          instruction: String(values.instruction ?? "").trim() || undefined,
-          template: String(values.template ?? "").trim() || undefined,
-          cloud: String(values.cloud ?? "").trim() || undefined,
-          files: [...checked].filter((key) => data.files.some((file) => file.value === key)),
-        },
-        this.deps.conversations.rollMakeFormNonce(event.chatId, event.operator.openId),
-      ),
+      f,
+      chatType,
+      preset,
+      deck,
     )
+    const result = await this.deps.conversations.refreshMakeFormFiles(
+      bot,
+      event.chatId,
+      event.operator.openId,
+      chatType,
+      f,
+      preset,
+      event.messageId,
+      "refresh",
+      deck,
+    )
+    const replyTo = result.messageId
+    if (result.count === 0) {
+      await bot
+        .sendMarkdown(
+          event.chatId,
+          "还没检测到可选文件。请先 **+ → 本机文件** 发送，等「已收到文件」提示后，再点一次「刷新文件列表」。",
+          { replyTo },
+        )
+        .catch(() => {})
+      return
+    }
+    if (result.mode === "republished") {
+      const hint =
+        result.labels.length > 0
+          ? `本卡片无法原地刷新，已补发制作卡。最近上传：**${result.labels.join("、")}**。请在新卡片 **「资料文件」** 里勾选。`
+          : `已补发制作卡，共 ${result.count} 个文件可选。请在新卡片 **「资料文件」** 下拉里勾选。`
+      await bot.sendMarkdown(event.chatId, hint, { replyTo }).catch(() => {})
+    } else if (result.labels.length > 0) {
+      await bot
+        .sendMarkdown(
+          event.chatId,
+          `已刷新。最近上传：**${result.labels.join("、")}**。请在 **「资料文件」** 下拉框勾选后点「开始生成」。`,
+          { replyTo },
+        )
+        .catch(() => {})
+    }
   }
 
   /** 品类按钮 → 原卡原地换成对应制作表单。 */
-  private async resolveMakeForm(bot: FeishuBot, event: CardActionEvent, format: string): Promise<void> {
+  private async resolveMakeForm(bot: FeishuBot, event: CardActionEvent, format: string, deckRaw?: string): Promise<void> {
     const f = format === "pptx" || format === "docx" || format === "pdf" ? format : undefined
     if (!f) return
-    const data = this.deps.conversations.makeFormData(event.chatId, event.operator.openId, f)
+    const chatType = await this.makeChatType(bot, event.chatId)
+    const deck = this.deckOf(f, deckRaw)
+    const data = this.deps.conversations.makeFormData(bot, event.chatId, event.operator.openId, f, chatType, deck)
     const nonce = this.deps.conversations.issueMakeForm(event.chatId, event.operator.openId)
+    this.deps.conversations.rememberMakeFormCard(event.chatId, event.operator.openId, event.messageId, f, chatType, undefined, deck)
     await bot.updateCard(event.messageId, makeFormCard(data, undefined, nonce))
   }
 
+  private async makeChatType(bot: FeishuBot, chatId: string): Promise<"p2p" | "group"> {
+    const chat = await bot.getChatInfo(chatId).catch(() => undefined)
+    return String((chat as { chatType?: string } | undefined)?.chatType ?? "p2p") === "group" ? "group" : "p2p"
+  }
+
   /** 制作表单提交:校验 → 组装任务 → 原卡换成确认卡,生成走正常流式流程。 */
-  private async resolveMakeSubmit(bot: FeishuBot, event: CardActionEvent, format: string, nonce?: number): Promise<void> {
+  private async resolveMakeSubmit(bot: FeishuBot, event: CardActionEvent, format: string, nonce?: number, deckRaw?: string): Promise<void> {
     const f = format === "pptx" || format === "docx" || format === "pdf" || format === "xlsx" || format === "copy" ? format : undefined
     if (!f) return
     if (!this.deps.conversations.makeFormActive(event.chatId, event.operator.openId, nonce)) {
@@ -609,36 +892,132 @@ export class InteractionService {
     }
     const values = extractFormValues(event)
     const instruction = String(values.instruction ?? "").trim()
-    if (instruction.length < 4) {
-      await bot.updateCard(
-        event.messageId,
-        statusCard("⚠️ 任务未提交", "请填写具体指令(至少 4 个字),再点「开始生成」。", "orange"),
-      )
-      return
-    }
-    const fileKeys = Array.isArray(values.files) ? values.files.map(String).filter((key) => key.length > 0) : []
-    const template = String(values.template ?? "").trim()
+    const pickedFiles = formStringList(values.files)
+      ?.map((key) => key.trim())
+      .filter((key) => key.length > 0 && key !== MAKE_FORM_FILE_PLACEHOLDER)
+    const fileKeys =
+      pickedFiles ??
+      this.deps.conversations
+        .currentMakeFiles(event.chatId, event.operator.openId)
+        .filter((key) => key !== MAKE_FORM_FILE_PLACEHOLDER)
+    const rawTemplate = "template" in values ? String(values.template ?? "").trim() : ""
+    const remembered = this.deps.conversations.currentMakeTemplate(event.chatId, event.operator.openId)
+    const template = rawTemplate === "none" ? "" : rawTemplate || (remembered === "none" ? "" : remembered)
     const cloud = String(values.cloud ?? "").trim()
     const scenario = String(values.scenario ?? "").trim() || undefined
     const chat = await bot.getChatInfo(event.chatId).catch(() => undefined)
     const chatType = String((chat as { chatType?: string } | undefined)?.chatType ?? "p2p")
+    const deck = this.deckOf(f, deckRaw)
+    const data = this.deps.conversations.makeFormData(
+      bot,
+      event.chatId,
+      event.operator.openId,
+      f,
+      chatType === "group" ? "group" : "p2p",
+      deck,
+    )
+    const fileByName = new Map(data.files.flatMap((file) => [[file.value, file.value], [file.label, file.value]] as const))
+    const resolvedKeys = fileKeys.map((key) => fileByName.get(key) ?? key)
+    const missing: string[] = []
+    if (instruction.length < 4) missing.push("请填写具体指令（至少 4 个字）")
+    if (f === "pptx" && resolvedKeys.length === 0 && !cloud) {
+      missing.push(
+        data.files.length === 0
+          ? "请先点「添加本地文件」发送材料，再在「资料文件」里勾选"
+          : "请在「资料文件」里勾选至少一份材料",
+      )
+    }
+    const preset: MakeFormPreset = {
+      instruction: instruction || undefined,
+      template: template || undefined,
+      cloud: cloud || undefined,
+      files: resolvedKeys,
+    }
+    if (missing.length > 0) {
+      await this.keepMakeForm(bot, event, f, chatType === "group" ? "group" : "p2p", deck, data, preset, missing.join("；"))
+      return
+    }
     const result = await this.deps.conversations.submitMake(bot, {
       chatId: event.chatId,
       chatType: chatType === "group" ? "group" : "p2p",
       senderId: event.operator.openId,
       format: f,
       instruction,
-      fileKeys,
-      template,
+      fileKeys: resolvedKeys,
+        template: template || "",
       cloud,
       scenario,
+      deck,
     })
     if (!result.ok) {
-      await bot.updateCard(event.messageId, statusCard("⚠️ 任务未提交", result.error, "orange"))
+      await this.keepMakeForm(
+        bot,
+        event,
+        f,
+        chatType === "group" ? "group" : "p2p",
+        deck,
+        data,
+        preset,
+        result.error,
+      )
       return
     }
     this.deps.conversations.revokeMakeForm(event.chatId, event.operator.openId)
-    await bot.updateCard(event.messageId, makeSubmittedCard(f, instruction, fileKeys.length, template, scenario))
+    this.deps.conversations.clearMakeErrorCard(event.messageId)
+    const dismissed = this.deps.conversations.dismissMakeFailures(
+      bot,
+      event.chatId,
+      event.operator.openId,
+      event.messageId,
+    )
+    try {
+      await bot.updateCard(event.messageId, makeSubmittedCard(f, instruction, result.fileCount, result.templateLabel, scenario, deck))
+    } catch (error) {
+      this.deps.logger.warn("Failed to replace make form after submit", { error: message(error) })
+    }
+    result.start()
+    await dismissed
+  }
+
+  /** 缺必填项时留在原卡片上，换新按钮编号，避免第二次提交被飞书去重丢掉。 */
+  private async keepMakeForm(
+    bot: FeishuBot,
+    event: CardActionEvent,
+    format: MakeFormat,
+    chatType: "p2p" | "group",
+    deck: DeckTask | undefined,
+    data: MakeFormData,
+    preset: MakeFormPreset,
+    reason: string,
+  ): Promise<void> {
+    const nonce = this.deps.conversations.rollMakeFormNonce(event.chatId, event.operator.openId)
+    this.deps.conversations.rememberMakeFormCard(
+      event.chatId,
+      event.operator.openId,
+      event.messageId,
+      format,
+      chatType,
+      preset,
+      deck,
+    )
+    this.deps.audit.record("make.rejected", {
+      chatId: event.chatId,
+      operator: event.operator.openId,
+      reason,
+      picked: preset.files?.length ?? 0,
+    })
+    this.deps.conversations.markMakeErrorCard(event.messageId)
+    await bot
+      .updateCard(event.messageId, makeFormCard(data, preset, nonce, { errorHint: reason }))
+      .catch(async () => {
+        const sent = await bot
+          .sendMarkdown(event.chatId, `⚠️ ${reason}\n请在原卡片上改完，再点「开始生成」。`, {
+            replyTo: event.messageId,
+          })
+          .catch(() => undefined)
+        const noticeId = messageIdOf(sent)
+        if (noticeId) this.deps.conversations.noteMakeFailure(event.chatId, event.operator.openId, noticeId)
+      })
   }
 
   private async refreshCronManage(bot: FeishuBot, event: CardActionEvent): Promise<void> {
@@ -757,6 +1136,7 @@ export class InteractionService {
       }
       email = actual
       store.set(openId, email, { chatId: event.chatId, bot: bot.name })
+      cron.resumeMailJobsForOwner(openId)
     } else if (!email) {
       await bot.updateCard(event.messageId, mailSubscribeCard(undefined, "还没有绑定邮箱，请重新填写。"))
       return
@@ -795,6 +1175,116 @@ export class InteractionService {
     )
   }
 
+  /** 情报档案按钮：追踪改原卡；竞标/成本/竞品在下面跟一条带出处的结果卡。 */
+  private async resolveIntel(bot: FeishuBot, event: CardActionEvent, action: string, itemId: string, jobName: string): Promise<void> {
+    const intel = this.deps.getIntel?.()
+    const cron = this.deps.getCron?.()
+    if (!intel || !cron) {
+      await bot.sendCardResilient(event.chatId, statusCard("情报档案", "这条订阅已经不在了，按钮无法继续。", "orange"), {
+        replyTo: event.messageId,
+      })
+      this.deps.audit.record("intel.stale", { name: jobName, itemId, action, reason: "no_store" })
+      return
+    }
+    // 订阅改名后，飞书里旧卡按钮仍带旧名字；用条目 id 找回现行档案与任务。
+    let archiveName = jobName
+    let job = cron.find(jobName)
+    if (!job || !intel.getItem(jobName, itemId)) {
+      const mapped = intel.findArchiveForItem(itemId)
+      if (mapped) {
+        archiveName = mapped
+        job = cron.find(mapped) ?? job
+      }
+    }
+    if (!job) {
+      await bot.sendCardResilient(event.chatId, statusCard("情报档案", "这条订阅已经不在了，按钮无法继续。", "orange"), {
+        replyTo: event.messageId,
+      })
+      this.deps.audit.record("intel.stale", { name: jobName, archiveName, itemId, action, reason: "job_missing" })
+      return
+    }
+    if (action === "exclude") {
+      intel.exclude(archiveName, itemId)
+      const saved = intel.delivery(archiveName, event.messageId)
+      if (saved) {
+        await bot.updateCard(
+          event.messageId,
+          intelDigestCard(job.name, saved.items, saved.nextLabel, saved.lockedIds),
+        )
+      }
+      this.deps.audit.record("intel.exclude", { name: job.name, itemId, operator: event.operator.openId, from: jobName })
+      return
+    }
+    if (action === "track") {
+      const item = intel.getItem(archiveName, itemId)
+      if (!item || item.status === "excluded") return
+      const entity =
+        item.subjectEntity?.trim() ||
+        item.matchedTrackedEntity?.trim() ||
+        item.title.replace(/\s+/g, " ").trim().slice(0, 40)
+      if (entity) intel.addTrackedEntities(archiveName, [entity])
+      intel.lockDeliveryItem(archiveName, event.messageId, itemId)
+      const saved = intel.delivery(archiveName, event.messageId)
+      if (saved) {
+        await bot.updateCard(
+          event.messageId,
+          intelDigestCard(job.name, saved.items, saved.nextLabel, saved.lockedIds),
+        )
+      }
+      this.deps.audit.record("intel.track", {
+        name: job.name,
+        itemId,
+        entity,
+        operator: event.operator.openId,
+        from: jobName,
+      })
+      return
+    }
+    if (action !== "cost" && action !== "compete" && action !== "plan") return
+    const item = intel.getItem(archiveName, itemId)
+    if (!item || item.status === "excluded") {
+      this.deps.audit.record("intel.stale", { name: job.name, itemId, action, reason: "item_missing" })
+      return
+    }
+    const scene: IntelScene = action
+    const cardTitle =
+      scene === "cost" ? "💰 成本与排期" : scene === "compete" ? "⚔️ 竞品差距" : "🎯 竞标策略"
+    // 跟帖进本会话流式生成；定时检索仍走侧会话 pregenerate。
+    const prompt = intelActionPrompt(
+      scene,
+      job.name,
+      item,
+      action === "compete" ? intel.recent(archiveName) : [],
+      intel.trackedEntities(archiveName),
+    )
+    const productContext = detectProductContext(bot.name, `${job.name}\n${prompt}`)
+    const finalPrompt = productContext ? buildProductContextPrompt(prompt, productContext) : prompt
+    try {
+      await this.deps.conversations.runInChat(bot, job.chatId, finalPrompt, {
+        userId: job.userId,
+        userOpenId: job.ownerOpenId ?? event.operator.openId,
+        replyTo: event.messageId,
+        cardTitle,
+        agent: "pm-a81-opportunity",
+      })
+      this.deps.audit.record("intel.action", { name: job.name, action, itemId, from: jobName })
+    } catch (error) {
+      this.deps.logger.warn("Intel action failed", {
+        action,
+        name: job.name,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      await bot
+        .sendCardResilient(
+          event.chatId,
+          statusCard(cardTitle, "这次没有生成出内容。订阅仍然有效，可以过一会儿再点一次。", "orange"),
+          { replyTo: event.messageId },
+        )
+        .catch(() => {})
+      this.deps.audit.record("intel.action_empty", { name: job.name, action, itemId })
+    }
+  }
+
   /** 订阅表单卡提交:option value 已带频率等字段,在这里校验与组装。value.f 带旧订阅名时为编辑替换。 */
   private async resolveCronSubscribe(bot: FeishuBot, event: CardActionEvent, value: CardValue): Promise<void> {
     const cron = this.deps.getCron?.()
@@ -827,18 +1317,39 @@ export class InteractionService {
       senderId: event.operator.openId,
       senderName: event.operator.name ?? "user",
     }
+    // 编辑：先卸旧任务（保留档案）→ 档案跟到新名 → 再按新配置落盘。
+    // 之后列表/暂停/删除/推送/按钮跟帖一律只认编辑后的订阅。
+    const editing = value.f?.trim()
+    let suffix = ""
+    if (editing) {
+      const owned = this.ownJob(cron, event, editing)
+      if (!owned) {
+        await bot.updateCard(
+          event.messageId,
+          statusCard("⚠️ 无法保存", `原订阅 **${editing}** 不存在或无权编辑。请打开「我的订阅」再试。`, "orange"),
+        )
+        return
+      }
+      await cron.remove(editing, { keepIntel: true })
+      if (editing !== name) {
+        this.deps.getIntel?.()?.rename(editing, name)
+        suffix = `\n已用 **${name}** 替换 **${editing}**。之后增删改查都按新订阅执行。`
+      } else {
+        suffix = `\n已更新 **${name}**。之后增删改查都按本次保存的内容与时间执行。`
+      }
+    }
     const result = await cron.add(
       [name, String(minute), String(hour), freq.dom, "*", freq.dow, prompt],
       identity,
       bot.name,
     )
-    let suffix = ""
-    if (value.f && value.f !== name) {
-      // Edit mode with a renamed subscription: drop the old entry after the new one lands.
-      await cron.remove(value.f)
-      suffix = `\n已替换旧订阅 **${value.f}**。`
-    }
-    this.deps.audit.record("cron.subscribe_card", { bot: bot.name, chatId: event.chatId, name, operator: event.operator.openId, edit: value.f })
+    this.deps.audit.record("cron.subscribe_card", {
+      bot: bot.name,
+      chatId: event.chatId,
+      name,
+      operator: event.operator.openId,
+      edit: editing || undefined,
+    })
     await bot.updateCard(event.messageId, statusCard("⏰ 订阅结果", result + suffix, "green"))
   }
 
@@ -1040,7 +1551,19 @@ function coerce(field: FormField, raw: string): FormValue {
   return raw
 }
 
+function messageIdOf(sent: unknown): string | undefined {
+  if (!sent || typeof sent !== "object") return undefined
+  const row = sent as { messageId?: unknown; message_id?: unknown }
+  const id = row.messageId ?? row.message_id
+  return typeof id === "string" && id.length > 0 ? id : undefined
+}
+
 function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function studioErrorMessage(error: unknown): string {
+  if (error instanceof StudioApiError) return error.message
   return error instanceof Error ? error.message : String(error)
 }
 
@@ -1093,24 +1616,42 @@ function studioDraftFrom(value: CardValue): StudioDraft {
   }
 }
 
-/**
- * Read the typed input values a card `form` submits. Feishu delivers them as
- * `action.form_value` (a name→value map). The SDK's normalized event does not
- * surface the field, so we probe the raw payload at the shapes seen across
- * surfaces, and fall back to the (runtime-only) `action` property.
- */
-function extractFormValues(event: CardActionEvent): Record<string, unknown> {
-  const candidates: unknown[] = [
-    (event.action as { form_value?: unknown } | undefined)?.form_value,
-    (event.raw as { action?: { form_value?: unknown } } | undefined)?.action?.form_value,
-    (event.raw as { event?: { action?: { form_value?: unknown } } } | undefined)?.event?.action?.form_value,
-  ]
-  for (const candidate of candidates) {
-    if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
-      return candidate as Record<string, unknown>
+function parseCardCallbackValue(raw: unknown): CardValue | undefined {
+  let value: unknown = raw
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value) as unknown
+    } catch {
+      return undefined
     }
   }
-  return {}
+  if (!value || typeof value !== "object" || !("k" in value)) return undefined
+  return value as CardValue
+}
+
+function mergeSkillDraftFromForm(
+  cached: SkillFormDraft | undefined,
+  values: Record<string, unknown>,
+  id?: string,
+): SkillDraft {
+  const name =
+    formFieldString(values.skill_name ?? values.name).trim() || (cached?.name ?? "").trim()
+  const triggersText =
+    formFieldString(values.triggers).trim() ||
+    (cached?.triggers?.length ? cached.triggers.join(" ") : "")
+  const scene = formFieldString(values.scene).trim() || (cached?.scene ?? "").trim()
+  const steps = formFieldString(values.steps).trim() || (cached?.steps ?? "").trim()
+  const output = formFieldString(values.output).trim() || (cached?.output ?? "").trim()
+  const scopeRaw = formFieldString(values.scope).trim() || cached?.scope
+  return {
+    id,
+    name,
+    triggers: parseTriggers(triggersText),
+    scene,
+    steps,
+    output,
+    scope: scopeRaw === "shared" ? "shared" : "personal",
+  }
 }
 
 /** Whether a field has a usable answer (the AI treats a blank field as unanswered). */

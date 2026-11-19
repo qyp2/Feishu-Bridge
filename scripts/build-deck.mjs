@@ -61,15 +61,15 @@ for (const section of model.sections) {
       x: 0.55,
       y: 0.28,
       w: 12,
-      h: 0.62,
-      fontSize: 28,
+      h: 0.72,
+      fontSize: 32,
       bold: true,
       fontFace: FONT,
       color: "1F4E79",
       margin: 0,
     })
-    slide.addShape(pptx.ShapeType.rect, { x: 0.55, y: 1.02, w: 2.2, h: 0.045, fill: { color: "1F4E79" } })
-    slide.addText(toRuns(group), { x: 0.55, y: 1.25, w: 12.1, h: 5.7, fontFace: FONT, valign: "top" })
+    slide.addShape(pptx.ShapeType.rect, { x: 0.55, y: 1.12, w: 2.2, h: 0.045, fill: { color: "1F4E79" } })
+    slide.addText(toRuns(group), { x: 0.55, y: 1.32, w: 12.1, h: 5.6, fontFace: FONT, valign: "top" })
     pages += 1
   }
 }
@@ -166,7 +166,7 @@ function pieceGroups(pieces) {
 }
 
 function estimateHeight(piece) {
-  const size = (piece.role === "subtitle" ? 18 : 16) * 12700
+  const size = (piece.role === "subtitle" ? 20 : 18) * 12700
   const lineWidth = 11100000
   let units = 0
   for (const ch of piece.text) units += ch.codePointAt(0) > 0x2e7f ? 1000 : 560
@@ -177,12 +177,12 @@ function estimateHeight(piece) {
 function toRuns(pieces) {
   return pieces.map((piece) => {
     if (piece.role === "subtitle") {
-      return { text: piece.text, options: { fontFace: FONT, fontSize: 18, bold: true, color: "1F4E79", breakLine: true, paraSpaceBefore: 12, paraSpaceAfter: 4 } }
+      return { text: piece.text, options: { fontFace: FONT, fontSize: 20, bold: true, color: "1F4E79", breakLine: true, paraSpaceBefore: 12, paraSpaceAfter: 4 } }
     }
     if (piece.role === "bullet") {
-      return { text: piece.text, options: { fontFace: FONT, fontSize: 16, color: "333333", bullet: { indent: 16 }, breakLine: true, paraSpaceAfter: 6 } }
+      return { text: piece.text, options: { fontFace: FONT, fontSize: 18, color: "333333", bullet: { indent: 16 }, breakLine: true, paraSpaceAfter: 6 } }
     }
-    return { text: piece.text, options: { fontFace: FONT, fontSize: 16, color: "444444", breakLine: true, paraSpaceAfter: 8 } }
+    return { text: piece.text, options: { fontFace: FONT, fontSize: 18, color: "444444", breakLine: true, paraSpaceAfter: 8 } }
   })
 }
 

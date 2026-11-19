@@ -6,6 +6,7 @@ import type {
   LarkChannel,
   NormalizedMessage,
   RejectEvent,
+  ResourceDescriptor,
   SendOptions,
   SendResult,
 } from "@larksuiteoapi/node-sdk"
@@ -97,6 +98,9 @@ export class FeishuBot {
       this.handlers.onReconnected?.()
     })
     await this.channel.connect()
+    // The card handler is registered inside connect(). Wrapping it earlier
+    // finds an empty map, so the click toast never goes back to Feishu.
+    installCardToastBridge(this.channel, this.logger)
     this.connected = true
     this.logger.info("Feishu long connection established", { appId: this.config.appId })
   }
@@ -171,6 +175,11 @@ export class FeishuBot {
       next = stampCardOwner(next, owner)
     }
     return this.channel.updateCard(messageId, next)
+  }
+
+  /** 撤回机器人自己发出的消息。用于清掉已经过时的失败提示。 */
+  async recallMessage(messageId: string): Promise<void> {
+    await this.channel.recallMessage(messageId)
   }
 
   /**
@@ -298,6 +307,21 @@ export class FeishuBot {
     return streamToBuffer(raw)
   }
 
+  /** Read a replied/parent message and extract file-like resources from its raw content. */
+  async getMessageResources(messageId: string): Promise<ResourceDescriptor[]> {
+    const raw = await this.raw.im.v1.message.get({
+      path: { message_id: messageId },
+      params: { user_id_type: "open_id" },
+    })
+    const data = ((raw as { data?: unknown })?.data ?? raw) as {
+      items?: Array<{ body?: { content?: string; file_name?: string }; msg_type?: string }>
+      body?: { content?: string; file_name?: string }
+      msg_type?: string
+    }
+    const item = data.items?.[0] ?? data
+    return extractResourcesFromMessageBody(item.msg_type, item.body?.content, item.body?.file_name)
+  }
+
   stream(
     to: string,
     input: Parameters<LarkChannel["stream"]>[1],
@@ -343,7 +367,81 @@ function streamToBuffer(raw: unknown): Promise<Buffer> {
   throw new Error("unexpected download response type")
 }
 
+function extractResourcesFromMessageBody(msgType: string | undefined, content: string | undefined, fileName?: string): ResourceDescriptor[] {
+  const text = parseMessageContent(content)
+  const resources: ResourceDescriptor[] = []
+  if (msgType === "file") {
+    const fileKey = firstMatch(text, /"file_key"\s*:\s*"([^"]+)"/)
+    if (fileKey) resources.push({ type: "file", fileKey, fileName: fileName ?? firstMatch(text, /"file_name"\s*:\s*"([^"]+)"/) })
+    return resources
+  }
+  if (msgType === "image") {
+    const imageKey = firstMatch(text, /"image_key"\s*:\s*"([^"]+)"/)
+    if (imageKey) resources.push({ type: "image", fileKey: imageKey })
+    return resources
+  }
+  for (const match of text.matchAll(/<file\b[^>]*\bkey="([^"]+)"[^>]*\bname="([^"]+)"[^>]*\/?>/gi)) {
+    const key = match[1]
+    if (!key) continue
+    resources.push({ type: "file", fileKey: key, fileName: match[2] ?? undefined })
+  }
+  for (const match of text.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)) {
+    const key = match[1]
+    if (!key) continue
+    resources.push({ type: "image", fileKey: key })
+  }
+  return resources
+}
+
+function parseMessageContent(content: string | undefined): string {
+  if (!content) return ""
+  try {
+    const parsed = JSON.parse(content) as { text?: string; image_key?: string; file_key?: string; file_name?: string }
+    if (parsed && typeof parsed === "object") return JSON.stringify(parsed)
+  } catch {
+    // keep raw string
+  }
+  return content
+}
+
+function firstMatch(text: string, re: RegExp): string | undefined {
+  return re.exec(text)?.[1] ?? undefined
+}
+
 const cardOwnerScope = new AsyncLocalStorage<string>()
+
+export interface CardCallbackBody {
+  toast: { type: "info" | "success" | "warning" | "error"; content: string }
+}
+
+/**
+ * The websocket layer sends back whatever `card.action.trigger` returns.
+ * LarkChannel drops that return, so a click can stage a toast here and the
+ * bridge wrapper below forwards it within Feishu's 3 second ack.
+ */
+const cardCallbackSlot = new AsyncLocalStorage<{ body?: CardCallbackBody }>()
+
+export function stageCardToast(content: string, type: CardCallbackBody["toast"]["type"] = "info"): void {
+  const store = cardCallbackSlot.getStore()
+  if (!store || !content.trim()) return
+  store.body = { toast: { type, content } }
+}
+
+function installCardToastBridge(channel: LarkChannel, logger: Logger): void {
+  const dispatcher = (channel as unknown as { dispatcher?: { handles?: Map<string, (data: unknown) => Promise<unknown>> } }).dispatcher
+  const handles = dispatcher?.handles
+  const prev = handles?.get("card.action.trigger")
+  if (!handles || !prev) {
+    logger.warn("Card toast bridge skipped; digest buttons will still work without a toast")
+    return
+  }
+  handles.set("card.action.trigger", (data: unknown) =>
+    cardCallbackSlot.run({}, async () => {
+      await prev(data)
+      return cardCallbackSlot.getStore()?.body
+    }),
+  )
+}
 
 /** Card updates inside this call keep the same owner, including after a restart. */
 export function bindCardOwner<T>(owner: string | undefined, fn: () => Promise<T>): Promise<T> {

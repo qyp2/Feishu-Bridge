@@ -42,14 +42,21 @@ export interface DocModel {
 const FONT = "Microsoft YaHei"
 const PDF_FONT = ["C:\\Windows\\Fonts\\Deng.ttf", "C:\\Windows\\Fonts\\msyh.ttf", "C:\\Windows\\Fonts\\simhei.ttf"]
 
+/** Drop Bridge-injected attachment preprocessing; it lists every office ext and must not drive export. */
+export function stripBridgeMaterialNote(text: string): string {
+  return text.replace(/\r?\n+\s*材料已预处理[\s\S]*/, "").trim()
+}
+
 /** Which office files this user message is asking to receive. */
-export function requestedFormats(text: string, fileNames: string[]): OfficeFormat[] {
+export function requestedFormats(text: string, fileNames: string[], explicit?: OfficeFormat[]): OfficeFormat[] {
+  if (explicit?.length) return [...explicit]
+  const user = stripBridgeMaterialNote(text)
   const formats = new Set<OfficeFormat>()
-  if (/pptx|\bppt\b|幻灯/i.test(text)) formats.add("pptx")
-  if (/pdf/i.test(text)) formats.add("pdf")
-  if (/docx|\bword\b|word\s*文档/i.test(text)) formats.add("docx")
-  if (/xlsx|excel|表格|工作簿/i.test(text)) formats.add("xlsx")
-  if (formats.size === 0 && /制作|生成|成稿|导出|写成/.test(text)) {
+  if (/pptx|\bppt\b|幻灯/i.test(user)) formats.add("pptx")
+  if (/\bpdf\b|\.pdf\b/i.test(user)) formats.add("pdf")
+  if (/docx|\bword\b|word\s*文档/i.test(user)) formats.add("docx")
+  if (/xlsx|\bexcel\b|表格|工作簿/i.test(user)) formats.add("xlsx")
+  if (formats.size === 0 && /制作|生成|成稿|导出|写成/.test(user)) {
     const names = fileNames.join(" ")
     if (/pptx|\.ppt\b/i.test(names)) formats.add("pptx")
     if (/docx|\.doc\b/i.test(names)) formats.add("docx")
@@ -98,8 +105,9 @@ export async function emitRequestedOffice(options: {
   fileNames: string[]
   startedAt: number
   templatePath?: string
+  formats?: OfficeFormat[]
 }): Promise<{ outputs: string[]; sources: string[] }> {
-  const formats = requestedFormats(options.requestText, options.fileNames)
+  const formats = requestedFormats(options.requestText, options.fileNames, options.formats)
   if (formats.length === 0) return { outputs: [], sources: [] }
   const source = latestDeliverableMarkdown(options.directory, options.startedAt)
   if (!source) return { outputs: [], sources: [] }
@@ -108,6 +116,7 @@ export async function emitRequestedOffice(options: {
     requestText: options.requestText,
     fileNames: options.fileNames,
     templatePath: options.templatePath,
+    formats,
   })
 }
 
@@ -136,8 +145,9 @@ export async function emitOfficeFile(options: {
   requestText: string
   fileNames: string[]
   templatePath?: string
+  formats?: OfficeFormat[]
 }): Promise<{ outputs: string[]; sources: string[] }> {
-  const formats = requestedFormats(options.requestText, options.fileNames)
+  const formats = requestedFormats(options.requestText, options.fileNames, options.formats)
   if (formats.length === 0) return { outputs: [], sources: [] }
   const source = options.source
   if (!fs.existsSync(source)) return { outputs: [], sources: [] }
@@ -201,7 +211,7 @@ async function writePptx(dest: string, model: DocModel, templatePath?: string, m
       return
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      if (message.includes("不会接受") || message.includes("根组合")) throw error
+      if (message.includes("不会接受") || message.includes("根组合") || message.includes("套版残留")) throw error
       console.error(message)
     }
   }

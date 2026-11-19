@@ -5,11 +5,15 @@ import { describeSkill, type Skill, type SkillScope } from "../skills/store.js"
 
 /** A stable marker used to route card callbacks back to the bridge. */
 export interface CardValue {
-  k: "perm" | "form" | "menu" | "cancel" | "gap" | "cron-sub" | "cron-mail-sub" | "cron-cancel" | "cron-del" | "cron-del-yes" | "cron-pause" | "cron-edit" | "cron-mgr" | "cron-urgent" | "make-form" | "make-sub" | "make-refresh" | "make-addfile" | "make-cancel" | "studio" | "login" | "skill-mgr" | "skill-new" | "skill-edit" | "skill-del" | "skill-del-yes" | "skill-save" | "skill-cancel" | "skill-use"
+  k: "perm" | "form" | "menu" | "cancel" | "gap" | "cron-sub" | "cron-mail-sub" | "cron-cancel" | "cron-del" | "cron-del-yes" | "cron-pause" | "cron-edit" | "cron-mgr" | "cron-urgent" | "make-form" | "make-sub" | "make-refresh" | "make-addfile" | "make-addtpl" | "make-cancel" | "studio" | "login" | "skill-mgr" | "skill-new" | "skill-edit" | "skill-del" | "skill-del-yes" | "skill-save" | "skill-cancel" | "skill-use" | "intel"
   s?: string
   r?: string
   d?: string
   f?: string
+  /** Hidden source URL for intel buttons; never rendered in the card body. */
+  u?: string
+  /** Hidden entity name for the track button. */
+  e?: string
   key?: string
   v?: unknown
   /** Per-render nonce so re-rendered cards are not collapsed by the SDK's click dedup. */
@@ -78,11 +82,40 @@ function baseCard(title: string, template: string, elements: object[]): object {
 }
 
 export function markdownCard(title: string, markdown: string, template = "blue"): object {
-  return baseCard(title, template, [{ tag: "markdown", content: markdown }])
+  return baseCard(title, template, markdownElements(markdown))
 }
 
 export function statusCard(title: string, markdown: string, template = "turquoise"): object {
-  return baseCard(title, template, [{ tag: "markdown", content: markdown }])
+  return baseCard(title, template, markdownElements(markdown))
+}
+
+/** 正文用 markdown；路由尾注拆成小号灰字，避免和正文同级字号。 */
+function markdownElements(markdown: string): object[] {
+  const { body, note } = splitRouteNote(markdown)
+  const elements: object[] = [{ tag: "markdown", content: body || " " }]
+  if (note) {
+    // 卡片 schema 2.0 已不支持 note 标签（ErrCode 200861），改用小号灰字 markdown。
+    elements.push({
+      tag: "markdown",
+      content: `<font color='grey'>┈ ${note}</font>`,
+    })
+  }
+  return elements
+}
+
+const ROUTE_NOTE_LINE =
+  /(?:^|\n)(?:<font color='grey'>\s*(?:\*|┈\s*)?)?(路由(?:\s*·\s*[^\n<]+|\s*[:：]\s*任务类型\s*=[^\n<]+))(?:\*<\/font>|<\/font>)?\s*$/u
+
+function splitRouteNote(markdown: string): { body: string; note?: string } {
+  const source = markdown || ""
+  const match = ROUTE_NOTE_LINE.exec(source)
+  if (!match) return { body: source }
+  const note = String(match[1] || "")
+    .replace(/^┈\s*/, "")
+    .replace(/^\*+|\*+$/g, "")
+    .trim()
+  const body = source.slice(0, match.index).replace(/\n{3,}/g, "\n\n").trimEnd()
+  return note ? { body, note } : { body: source }
 }
 
 export function permissionCard(request: PermissionRequest): object {
@@ -312,7 +345,7 @@ export function welcomeCard(sharedTemplates: string[], personalTemplates: string
   if (sharedTemplates.length) parts.push(`共享模板：${sharedTemplates.map((name) => `「${name}」`).join("、")}`)
   if (personalTemplates.length) parts.push(`我的模板：${personalTemplates.map((name) => `「${name}」`).join("、")}`)
   const templateLine = parts.length
-    ? `${parts.join("；")}。说「用${personalTemplates[0] ?? sharedTemplates[0]}模板」即可套用；也支持随消息上传新模板。`
+    ? `${parts.join("；")}。在制作卡的「模板」里选中后才会套用。`
     : "支持随消息上传企业模板套用；发 .pptx 并写「存为模板 名字」可建立个人模板库。"
   return baseCard("🤖 产品智能助手", "blue", [
     {
@@ -323,18 +356,16 @@ export function welcomeCard(sharedTemplates: string[], personalTemplates: string
     {
       tag: "markdown",
       content: [
-        "- 📊 **商业计划书 PPT 生成**：给材料即可自动成稿，套用企业模板直接汇报",
-        "- 📄 **产品标准化请示文档生成**：九大模块结构化请示，支持 PPT / Word / PDF",
-        "- 📉 **产品市场退出报告生成**：退出背景、影响与安排全套材料",
+        "- 📊 **商业计划书 / 产品化请示 / 产品退出评审**：三个菜单都打开同一张 PPT 制作卡，成稿技能不同",
+        "- 🧩 **PPT 背景模板**：只有在卡片里选中模板才会套用；可用「上传背景模板」发 .pptx，它只进入模板下拉",
         "- 📡 **商机资讯雷达**：推荐产品/领域相关展会、活动与资讯，支持追问分析与个人定时订阅",
         "- 📈 **产品管理专题分析**：需求、竞品、市场、研发、测试、发布、运营、反馈等 20 类",
-        "- 📑 **办公文件一键导出**：Markdown 内容转 PPT / Word / Excel / PDF",
       ].join("\n"),
     },
     { tag: "hr" },
     {
       tag: "markdown",
-      content: `**模板库**\n${templateLine}\n\n**我的技能**\n把你的做法攒成技能：说「技能」打开管理卡片，点「新建技能」填触发词与步骤，以后提到触发词就自动照做。\n\n**小提示**：直接说出任务即可，例如「用移动内部汇报模板做一份 XX 产品商业计划书 PPT」；点击下方菜单「帮助」查看使用说明。`,
+      content: `**模板库**\n${templateLine}\n\n**我的技能**\n把你的做法攒成技能：说「技能」打开管理卡片，点「新建技能」填触发词与步骤，以后提到触发词就自动照做。\n\n**小提示**：从菜单打开「商业计划书」「产品化请示」或「产品退出评审」，在卡片里填指令；要套版式时再在「模板」里选择。点击下方菜单「帮助」查看使用说明。`,
     },
   ])
 }
@@ -343,7 +374,7 @@ function selectOption(label: string, value: string): object {
   return { text: { tag: "plain_text", content: label }, value }
 }
 
-/** 多选下拉（form 容器内使用）;initial 为预选 value 数组。 */
+/** 多选下拉（form 容器内使用）;initial 为预选 value 数组，对应飞书字段 selected_values。 */
 function multiSelectStatic(name: string, placeholder: string, options: object[], initial?: string[]): object {
   const el: Record<string, unknown> = {
     tag: "multi_select_static",
@@ -352,7 +383,7 @@ function multiSelectStatic(name: string, placeholder: string, options: object[],
     placeholder: { tag: "plain_text", content: placeholder },
     options,
   }
-  if (initial && initial.length > 0) el.initial_value = initial
+  if (initial && initial.length > 0) el.selected_values = initial
   return el
 }
 
@@ -360,12 +391,77 @@ function multiSelectStatic(name: string, placeholder: string, options: object[],
 
 export type MakeFormat = "pptx" | "docx" | "pdf" | "xlsx" | "copy"
 
+/** 资料多选占位项；提交时须过滤，不可当作真实 fileKey。 */
+export const MAKE_FORM_FILE_PLACEHOLDER = "__none__"
+
+/** 制作卡 UI 版本号（卡片底部可见，用于确认 Bridge 已加载新代码）。 */
+export const MAKE_FORM_UI_REV = "20261103d"
+
+/** 三张菜单共用同一张 PPT 卡，提交时按这个字段锁定技能。 */
+export type DeckTask = "business-plan" | "product-request" | "product-exit"
+
+const DECK_PROMPT_HINT = "把【】换成产品名即可生成；也可整段改。保留【】时从资料识别产品名，识别不到标【待确认】，不要把占位句写进 PPT。"
+
+export const DECK_TASKS: Record<
+  DeckTask,
+  { title: string; taskType: string; skill: string; placeholder: string; prompt: string }
+> = {
+  "business-plan": {
+    title: "商业计划书",
+    taskType: "business-plan",
+    skill: "s31-business-plan",
+    placeholder: DECK_PROMPT_HINT,
+    prompt: [
+      "产品名称：【请改成产品名】",
+      "汇报对象：产品规划及开发评审会",
+      "补充要求：【可写必须强调的客户、价格或竞品；没有就删掉本行】",
+      "",
+      "请只依据已勾选资料，按技能 s31-business-plan 写完整商业计划书。章节、表格、缺数口径和结尾都以该技能为准，不要另起一套目录，也不要写成请示。成稿步骤只负责分页和套版，不要在正文里写排版规则或「判断：」。",
+    ].join("\n"),
+  },
+  "product-request": {
+    title: "产品化请示",
+    taskType: "product-request",
+    skill: "s32-product-packaging",
+    placeholder: DECK_PROMPT_HINT,
+    prompt: [
+      "产品名称：【请改成产品名】",
+      "文种：关于开展该产品标准化的请示",
+      "补充要求：【可写这次立项要解决的问题；没有就删掉本行】",
+      "",
+      "请只依据已勾选资料，按技能 s32-product-packaging 写完整产品化请示。九大模块、表格、缺数口径和结尾都以该技能为准。成稿步骤只负责分页和套版，不要在正文里写排版规则或「判断：」。",
+    ].join("\n"),
+  },
+  "product-exit": {
+    title: "产品退出评审",
+    taskType: "product-exit",
+    skill: "s33-product-exit",
+    placeholder: DECK_PROMPT_HINT,
+    prompt: [
+      "产品名称：【请改成产品名】",
+      "会议：产品管理跨部门协调工作组退出评审",
+      "补充要求：【可写计划下线时间或替代产品；没有就删掉本行】",
+      "",
+      "请只依据已勾选资料，按技能 s33-product-exit 写完整退出评审。章节、封面标题、口径和结尾都以该技能为准。销售数据、法务意见和补偿不得编造。成稿步骤只负责分页和套版，不要在正文里写排版规则或「判断：」。",
+    ].join("\n"),
+  },
+}
+
+export function parseDeckTask(value: string | undefined): DeckTask | undefined {
+  if (value === "business-plan" || value === "product-request" || value === "product-exit") return value
+  return undefined
+}
+
 export interface MakeFormData {
   format: MakeFormat
+  /** 三个专项菜单；有值时标题、占位和提交技能按专项走，表单仍是 PPT 卡。 */
+  deck?: DeckTask
   /** 已发到本会话的本地文件（缓存）:label 展示名,value 缓存文件名。 */
   files: Array<{ label: string; value: string }>
   sharedTemplates: string[]
   personalTemplates: string[]
+  /** 本用户通过「上传背景模板」收下的 pptx，只出现在模板下拉。 */
+  uploadedTemplates: Array<{ label: string; value: string }>
 }
 
 /** 刷新重渲染时的回填值:用户已填内容一字不丢。 */
@@ -387,12 +483,12 @@ const MAKE_COPY: Record<MakeFormat, { title: string; formatWord: string }> = {
   copy: { title: "文案制作", formatWord: "" },
 }
 
-/** 海报制作占位:诚实说明,不放假按钮。 */
+/** 海报制作入口说明：实际生成走创作工作台海报页。 */
 export function makePosterCard(): object {
   return statusCard(
     "🖼️ 海报制作",
-    "海报自动生成(排版 + 配图)正在建设中,暂未开放。\n现阶段可以先让我产出**海报文案与排版说明**(走「文案制作」),再交给设计工具或同事出图。",
-    "orange",
+    "请发送「生成海报」或「创作工作台」打开海报表单；需先「验证码登录」绑定网页端账号后才会真正出图。",
+    "blue",
   )
 }
 
@@ -401,45 +497,96 @@ export function makePosterCard(): object {
  * 本地文件通过「拖到聊天窗发送 → 点刷新」进入勾选区;刷新按钮是表单提交,
  * 已填内容随 form_value 带回并重渲染回填,不会丢失。
  */
-export function makeFormCard(data: MakeFormData, preset?: MakeFormPreset, nonce = nextFormNonce()): object {
-  const copy = MAKE_COPY[data.format]
+export function makeFormCard(
+  data: MakeFormData,
+  preset?: MakeFormPreset,
+  nonce = nextFormNonce(),
+  options?: { filesUpdatedBanner?: string; errorHint?: string },
+): object {
+  const copy = data.deck ? { title: DECK_TASKS[data.deck].title, formatWord: "PPT" } : MAKE_COPY[data.format]
   const elements: object[] = []
 
+  if (options?.errorHint?.trim()) {
+    elements.push({
+      tag: "markdown",
+      content:
+        `⚠️ **${escapeMarkdown(options.errorHint.trim())}**\n` +
+        "请**在本张卡片**里改完，再点「开始生成」。已填内容会保留。",
+    })
+    elements.push({ tag: "hr" })
+  }
+
+  if (options?.filesUpdatedBanner?.trim()) {
+    elements.push({
+      tag: "markdown",
+      content: `✅ ${escapeMarkdown(options.filesUpdatedBanner.trim())}`,
+    })
+    elements.push({ tag: "hr" })
+  }
+
+  const deckPrompt = data.deck ? DECK_TASKS[data.deck].prompt : undefined
+  elements.push({
+    tag: "markdown",
+    content: data.deck
+      ? "**具体指令**（已按本任务填好，可直接修改）"
+      : "**具体指令**",
+  })
   elements.push({
     tag: "input",
     name: "instruction",
     width: "fill",
     input_type: "multiline_text",
-    rows: 3,
-    max_length: 500,
-    default_value: preset?.instruction,
+    rows: 8,
+    max_length: 1000,
+    default_value: preset?.instruction?.trim() ? preset.instruction : deckPrompt,
     placeholder: {
       tag: "plain_text",
-      content:
-        data.format === "pptx"
-          ? "具体指令,如:做一份 FTTR 家庭组网方案的商业计划书 PPT,10 页以内,面向内部评审"
+      content: data.deck
+        ? DECK_TASKS[data.deck].placeholder
+        : data.format === "pptx"
+          ? DECK_TASKS["business-plan"].placeholder
           : data.format === "xlsx"
             ? "具体指令,如:把上传的销售记录整理成月度对账 Excel,含明细 sheet、汇总 sheet 和图表"
             : data.format === "copy"
               ? "具体指令,如:写一篇 5G 新通话的公众号推文,800 字,语气轻快"
-              : "具体指令,如:把上传的材料整理成一份产品请示文档,包含背景、方案、预算",
+              : "具体指令,如:把上传的材料整理成一份说明文档",
       },
   })
 
+  elements.push({
+    tag: "markdown",
+    content:
+      data.format === "pptx"
+        ? "**资料文件**（必填，可多选）\n点下方下拉框勾选。未勾选不会开始生成。"
+        : "**资料文件**（可多选）\n点下方 **「选择文件」/「上传后点刷新」** 下拉框勾选，不是单独的「本地文件」按钮。",
+  })
+  const fileOptions =
+    data.files.length > 0
+      ? data.files.map((file) => selectOption(file.label, file.value))
+      : [selectOption("暂无——请用 + 发送本机文件后点「刷新文件列表」", MAKE_FORM_FILE_PLACEHOLDER)]
+  const initialFiles = (preset?.files ?? []).filter(
+    (key) => key !== MAKE_FORM_FILE_PLACEHOLDER && data.files.some((file) => file.value === key),
+  )
+  elements.push(
+    multiSelectStatic(
+      "files",
+      data.files.length > 0 ? "选择文件" : "上传后点刷新",
+      fileOptions,
+      initialFiles.length > 0 ? initialFiles : undefined,
+    ),
+  )
   if (data.files.length > 0) {
-    elements.push({ tag: "markdown", content: "**资料文件**(可多选)" })
-    elements.push(
-      multiSelectStatic(
-        "files",
-        "选择文件",
-        data.files.map((file) => selectOption(file.label, file.value)),
-        preset?.files,
-      ),
-    )
+    const names = data.files.map((file) => file.label).join("、")
+    elements.push({
+      tag: "markdown",
+      content: `<font color='grey'>可选 ${data.files.length} 个:${escapeMarkdown(names.slice(0, 200))}${names.length > 200 ? "…" : ""}</font>`,
+      text_size: "notation",
+    })
   } else {
     elements.push({
       tag: "markdown",
-      content: "<font color='grey'>资料文件:点下方「添加本地文件」,用 + 号发送后自动勾选。</font>",
+      content:
+        "<font color='grey'>① 点「添加本地文件」或聊天框 **+ → 本机文件** 发送；② 等机器人回复「已收到文件」；③ 再点「刷新文件列表」。若下拉仍空，看下方新消息里的文件名提示。</font>",
       text_size: "notation",
     })
   }
@@ -455,12 +602,21 @@ export function makeFormCard(data: MakeFormData, preset?: MakeFormPreset, nonce 
       ),
     )
     const templateOptions = [
-      selectOption("不使用模板", ""),
-      ...data.personalTemplates.map((name) => selectOption(`【我的】${name}`, name)),
-      ...data.sharedTemplates.map((name) => selectOption(`【共享】${name}`, name)),
+      selectOption("不使用模板", "none"),
+      ...(data.uploadedTemplates ?? []).map((item) => selectOption(`【上传】${item.label}`, item.value)),
+      ...data.personalTemplates.map((name) => selectOption(`【我的】${name}`, `personal:${name}`)),
+      ...data.sharedTemplates.map((name) => selectOption(`【共享】${name}`, `shared:${name}`)),
     ]
-    elements.push({ tag: "markdown", content: "**模板**" })
-    elements.push(selectStatic("template", "选择模板", templateOptions, preset?.template ?? ""))
+    const templateValues = new Set(
+      templateOptions.map((item) => String((item as { value?: string }).value ?? "")),
+    )
+    const templatePick = preset?.template && templateValues.has(preset.template) ? preset.template : "none"
+    elements.push({
+      tag: "markdown",
+      content:
+        "**背景模板**（可选）\n只有在下拉里选中一项才会套用；选「不使用模板」则按默认版式生成。点「上传背景模板」后，用 **+ → 本机文件** 发送 .pptx，它只出现在这个下拉里，不会进入资料文件。",
+    })
+    elements.push(selectStatic("template", "选择模板", templateOptions, templatePick))
   }
 
   elements.push({
@@ -474,12 +630,20 @@ export function makeFormCard(data: MakeFormData, preset?: MakeFormPreset, nonce 
   elements.push({ tag: "hr" })
   elements.push(
     buttonRow([
-      formSubmitButton("开始生成", { n: nonce, k: "make-sub", f: data.format }, "primary", "submit"),
-      formSubmitButton("添加本地文件", { n: nonce, k: "make-addfile", f: data.format }, "default", "addfile"),
-      formSubmitButton("刷新文件列表", { n: nonce, k: "make-refresh", f: data.format }, "default", "refresh"),
-      formSubmitButton("取消", { n: nonce, k: "make-cancel", f: data.format }, "default", "cancelmake"),
+      formSubmitButton("开始生成", { n: nonce, k: "make-sub", f: data.format, d: data.deck }, "primary", "submit"),
+      formSubmitButton("添加本地文件", { n: nonce, k: "make-addfile", f: data.format, d: data.deck }, "default", "addfile"),
+      ...(data.format === "pptx"
+        ? [formSubmitButton("上传背景模板", { n: nonce, k: "make-addtpl", f: data.format, d: data.deck }, "default", "addtpl")]
+        : []),
+      formSubmitButton("刷新文件列表", { n: nonce, k: "make-refresh", f: data.format, d: data.deck }, "default", "refresh"),
+      formSubmitButton("取消", { n: nonce, k: "make-cancel", f: data.format, d: data.deck }, "default", "cancelmake"),
     ]),
   )
+  elements.push({
+    tag: "markdown",
+    content: `<font color='grey'>表单 ${MAKE_FORM_UI_REV} · 上传后等「已收到文件」→ 点「刷新文件列表」或依赖自动刷新</font>`,
+    text_size: "notation",
+  })
   return baseCard(copy.title, "blue", [{ tag: "form", name: "make_form", elements }])
 }
 
@@ -490,15 +654,17 @@ export function makeSubmittedCard(
   fileCount: number,
   template: string,
   scenario?: string,
+  deck?: DeckTask,
 ): object {
+  const title = deck ? DECK_TASKS[deck].title : MAKE_COPY[format].title
   const lines = [`指令:${instruction.slice(0, 80)}${instruction.length > 80 ? "…" : ""}`]
   const scene = findScenarioById(scenario)
   if (scene) lines.push(`场景:${scene.label}`)
   if (fileCount > 0) lines.push(`资料:${fileCount} 个文件`)
-  if (template) lines.push(`模板:${template}`)
+  lines.push(template ? `模板:${template}` : "模板:不使用")
   return statusCard(
-    `✅ ${MAKE_COPY[format].title}已提交`,
-    `${lines.join("\n")}\n\n生成完成后文件会直接发到本会话。`,
+    `✅ ${title}已提交`,
+    `${lines.join("\n")}\n\n生成完成后 PPT 会直接发到本会话。`,
     "green",
   )
 }
@@ -538,6 +704,9 @@ export interface StudioDraft {
   platform?: string
   tone?: string
   notice?: string
+  /** 来自网页端 /me；未登录时不传。 */
+  points?: number
+  loggedIn?: boolean
 }
 
 const STUDIO_CHANNELS = [
@@ -573,8 +742,14 @@ export function studioCard(draft: StudioDraft = { kind: "copy" }): object {
       item.kind === kind ? "primary" : "default",
       `pick_${item.kind}`,
     )
+  const pointsLine =
+    draft.loggedIn && typeof draft.points === "number"
+      ? `**积分余额：${draft.points}**`
+      : draft.loggedIn
+        ? "**积分余额：已登录**"
+        : "**积分余额：未登录**（请先发送「验证码登录」）"
   const elements: object[] = [
-    { tag: "markdown", content: `**积分余额：${STUDIO_POINTS}**` },
+    { tag: "markdown", content: pointsLine },
     { tag: "markdown", content: "**选择功能**" },
     buttonRow(STUDIO_ACTIONS.map(pick)),
     { tag: "markdown", content: `**${action.label}**` },
@@ -678,9 +853,11 @@ export function studioPendingCard(): object {
   return statusCard("AI 创作工作台", "正在生成中，请稍候。完成后这张卡片会自动更新。", "turquoise")
 }
 
-export function studioResultCard(draft: StudioDraft): object {
+export function studioResultCard(
+  draft: StudioDraft,
+  result?: { text?: string; imageUrls?: string[]; pointsLeft?: number; dryRun?: boolean; error?: string },
+): object {
   const nonce = nextFormNonce()
-  const left = Math.max(0, STUDIO_POINTS - STUDIO_COST)
   const action = studioAction(draft.kind)
   const detail =
     draft.kind === "commerce"
@@ -695,12 +872,26 @@ export function studioResultCard(draft: StudioDraft): object {
             `输出字数：${escapeMarkdown(draft.words || "200")}`,
           ].join("\n")
         : escapeMarkdown(draft.prompt ?? "")
-  return baseCard(`${action.label}结果`, "green", [
-    {
-      tag: "markdown",
-      content: `**${action.label}**\n\n${detail}\n\n<font color='grey'>网页接口还没接上，这里先回显你填的内容。</font>`,
-    },
-    { tag: "markdown", content: `本次消耗 ${STUDIO_COST} 积分，剩余可用积分：${left}。` },
+  const bodyParts = [`**${action.label}**`, detail]
+  if (result?.error) {
+    bodyParts.push(`\n⚠️ ${escapeMarkdown(result.error)}`)
+  } else if (result?.text?.trim()) {
+    bodyParts.push(`\n${escapeMarkdown(result.text.trim()).slice(0, 3500)}`)
+  } else if (result?.imageUrls?.length) {
+    bodyParts.push(`\n已生成 ${result.imageUrls.length} 张图，图片会发到本会话。`)
+  } else {
+    bodyParts.push("\n生成完成。")
+  }
+  if (result?.dryRun) bodyParts.push("\n<font color='grey'>当前为 dry-run（未扣积分、未调模型）。</font>")
+  const pointsLine =
+    typeof result?.pointsLeft === "number"
+      ? `剩余可用积分：${result.pointsLeft}。`
+      : typeof draft.points === "number"
+        ? `参考余额：${draft.points}（以网页端为准）。`
+        : `预计消耗约 ${STUDIO_COST} 积分。`
+  return baseCard(result?.error ? `${action.label}失败` : `${action.label}结果`, result?.error ? "orange" : "green", [
+    { tag: "markdown", content: bodyParts.join("\n\n") },
+    { tag: "markdown", content: pointsLine },
     buttonRow([
       callbackButton(
         "修改内容",
@@ -727,7 +918,7 @@ export function studioResultCard(draft: StudioDraft): object {
   ])
 }
 
-/** 验证码登录预览。文案改这里。私聊发送「验证码登录」打开。不会真正发送短信。 */
+/** 验证码登录（对接玉树 OpenAPI）。私聊发送「验证码登录」打开。 */
 export interface LoginDraft {
   phone?: string
   code?: string
@@ -744,14 +935,19 @@ export function maskPhone(phone: string): string {
 export function loginCard(draft: LoginDraft = {}): object {
   const nonce = nextFormNonce()
   const elements: object[] = [
-    { tag: "markdown", content: "检测到您尚未绑定网页端账号，请先验证手机号完成登录。" },
-    { tag: "markdown", content: "**手机号**" },
+    {
+      tag: "markdown",
+      content: draft.notice?.includes("海报")
+        ? "生成海报前需要先绑定网页端账号。登录成功后会自动进入海报描述。"
+        : "绑定网页端账号后，才能使用创作工作台的文案 / 海报 / 电商套图（消耗网页端积分）。",
+    },
+    { tag: "markdown", content: "**手机号**（内地 11 位或香港 8 位）" },
     {
       tag: "input",
       name: "phone",
       width: "fill",
       default_value: draft.phone,
-      placeholder: { tag: "plain_text", content: "请输入手机号" },
+      placeholder: { tag: "plain_text", content: "如 68478466 或 13800138000" },
     },
     buttonRow([
       formSubmitButton(
@@ -766,9 +962,9 @@ export function loginCard(draft: LoginDraft = {}): object {
       tag: "input",
       name: "code",
       width: "fill",
-      max_length: 6,
+      max_length: 8,
       default_value: draft.code,
-      placeholder: { tag: "plain_text", content: "请输入 6 位验证码" },
+      placeholder: { tag: "plain_text", content: "请输入短信验证码" },
     },
   ]
   if (draft.notice) elements.push({ tag: "markdown", content: `<font color='orange'>${escapeMarkdown(draft.notice)}</font>` })
@@ -776,10 +972,12 @@ export function loginCard(draft: LoginDraft = {}): object {
   return baseCard("账号绑定", "blue", [{ tag: "form", name: "login_form", elements }])
 }
 
-export function loginDoneCard(phone: string): object {
+export function loginDoneCard(phone: string, points?: number, nextHint?: string): object {
+  const pointsLine = typeof points === "number" ? `当前积分：${points}` : "当前积分：已登录（以网页端为准）"
+  const next = nextHint?.trim() || "可以发送「海报生成」开始描述并出图。"
   return statusCard(
     "账号绑定成功",
-    `当前积分：${STUDIO_POINTS}\n绑定手机号：${maskPhone(phone)}\n\n<font color='grey'>这是预览，手机号和验证码没有发给网页端。</font>`,
+    `${pointsLine}\n绑定手机号：${maskPhone(phone)}\n\n${next}`,
     "green",
   )
 }
@@ -858,7 +1056,7 @@ export function subscribeCard(edit?: CronJobInfo): object {
     {
       tag: "markdown",
       content: edit
-        ? `正在编辑订阅 **${escapeMarkdown(edit.name)}**，调整后提交即可替换。`
+        ? `正在编辑订阅 **${escapeMarkdown(edit.name)}**。保存后旧任务会被替换，之后列表、暂停、删除、推送和卡片按钮都按新内容执行。`
         : "选择推送频率与时间、填写关注内容，我会按时把最新资讯推送到本会话。",
     },
     { tag: "markdown", content: "**📌 订阅内容**" },
@@ -1120,20 +1318,33 @@ const SCOPE_OPTIONS = (isAdmin: boolean): object[] =>
     : [selectOption("仅自己可用", "personal")]
 
 /** 技能表单卡：新建 / 编辑共用。 */
-export function skillFormCard(draft: SkillFormDraft = {}, options: { isAdmin: boolean } = { isAdmin: false }): object {
-  const elements: object[] = [
-    {
+export function skillFormCard(
+  draft: SkillFormDraft = {},
+  options: { isAdmin: boolean; errorHint?: string } = { isAdmin: false },
+): object {
+  const elements: object[] = []
+  if (options.errorHint?.trim()) {
+    elements.push({
       tag: "markdown",
-      content: draft.id
-        ? "改完点「保存」，下一条消息起按新版本执行。"
-        : "**触发词**决定什么时候自动套用；**执行步骤**写得越像操作手册，效果越稳。",
-    },
-  ]
+      content:
+        `⚠️ **${escapeMarkdown(options.errorHint.trim())}**\n` +
+        "请**在本张卡片**里改对应输入框，再点「保存技能」。已填内容会保留。\n" +
+        "<font color='grey'>不要重新发「新建技能」或从技能库再开一张新表单，否则会换成空白卡片。</font>",
+    })
+    elements.push({ tag: "hr" })
+  }
+  elements.push({
+    tag: "markdown",
+    content: draft.id
+      ? "改完点「保存」，下一条消息起按新版本执行。"
+      : "**触发词**决定什么时候自动套用；**执行步骤**写得越像操作手册，效果越稳。",
+  })
 
   elements.push({ tag: "markdown", content: "**技能名称**\n例：竞品周报、客户拜访纪要、周会材料" })
   elements.push({
     tag: "input",
-    name: "name",
+    // 避免与回调 action.name / 保留键冲突；服务端同时兼容旧字段 name。
+    name: "skill_name",
     width: "fill",
     max_length: 24,
     default_value: draft.name,

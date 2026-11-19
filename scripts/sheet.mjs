@@ -3,9 +3,12 @@
  * Count rows in a workbook extract written by feishu-bridge.
  *
  *   node sheet.mjs headers <table.txt>
- *   node sheet.mjs count <table.txt> [--sheet 名称] --where "列::empty" --where "列::contains::文本"
+ *   node sheet.mjs count <table.txt> [--sheet 名称] --where "列::empty" --any "列::contains::文本"
+ *   node sheet.mjs top <table.txt> --column 列名 [--sheet 名称] --where "列::empty"
  *
- * --where 之间是并且。比较：empty、not-empty、contains::文本、not-contains::文本、equals::文本。
+ * --where 之间是并且，--any 之间是或者，两组同时出现时先满足全部 --where 再满足任一 --any。
+ * 比较：empty、not-empty、contains::文本、not-contains::文本、equals::文本。
+ * top 只打印该列出现最多的姓名，不打印其他单元格。
  * 只接受桥接抽出的表格文本，并且路径必须在会话收件或文件缓存里。不打印单元格原文。
  */
 import fs from "node:fs"
@@ -19,7 +22,7 @@ const fail = (message) => {
 const args = process.argv.slice(2)
 const command = args[0]
 const fileArg = args[1]
-if (!command || !fileArg || (command !== "headers" && command !== "count")) {
+if (!command || !fileArg || (command !== "headers" && command !== "count" && command !== "top")) {
   fail('用法：sheet.mjs headers <表格.txt> 或 sheet.mjs count <表格.txt> --where "列::empty"')
 }
 
@@ -54,7 +57,9 @@ if (command === "headers") {
 if (completeness !== "完整") fail(`表格${completeness}，不能计算个数或占比`)
 
 let sheetName = ""
+let topColumn = ""
 const wheres = []
+const anys = []
 for (let i = 2; i < args.length; i += 1) {
   const token = args[i]
   if (token === "--sheet") {
@@ -62,33 +67,59 @@ for (let i = 2; i < args.length; i += 1) {
     i += 1
     continue
   }
-  if (token === "--where") {
-    wheres.push(parseWhere(args[i + 1] ?? ""))
+  if (token === "--column") {
+    topColumn = args[i + 1] ?? ""
+    i += 1
+    continue
+  }
+  if (token === "--where" || token === "--any") {
+    const parsed = parseWhere(args[i + 1] ?? "")
+    if (token === "--where") wheres.push(parsed)
+    else anys.push(parsed)
     i += 1
     continue
   }
   fail(`无法识别参数 ${token}`)
 }
-if (wheres.length === 0) fail("count 至少要一个 --where")
+if (command === "count" && wheres.length === 0 && anys.length === 0) fail("count 至少要一个 --where 或 --any")
+if (command === "top" && !topColumn.trim()) fail("top 需要 --column 列名")
 
 const sheet = sheetName ? sheets.find((item) => item.name === sheetName) : sheets.length === 1 ? sheets[0] : undefined
 if (!sheet) fail(`要指定 --sheet。可选：${sheets.map((item) => item.name).join("、")}`)
 
-const indexes = wheres.map((where) => columnIndex(sheet.headers, where.column))
+const whereIndexes = wheres.map((where) => columnIndex(sheet.headers, where.column))
+const anyIndexes = anys.map((where) => columnIndex(sheet.headers, where.column))
+const topIndex = command === "top" ? columnIndex(sheet.headers, topColumn) : -1
 
-let matched = 0
+const matchedRows = []
 for (const row of sheet.rows) {
-  const ok = wheres.every((where, position) => matchCell(row[indexes[position]] ?? "", where))
-  if (!ok) continue
-  matched += 1
+  const andOk = wheres.every((where, position) => matchCell(row[whereIndexes[position]] ?? "", where))
+  const orOk = anys.length === 0 || anys.some((where, position) => matchCell(row[anyIndexes[position]] ?? "", where))
+  if (andOk && orOk) matchedRows.push(row)
 }
-const rows = sheet.rows.length
-const ratio = rows === 0 ? "0%" : `${((matched / rows) * 100).toFixed(2)}%`
-console.log(`filters ${wheres.length}`)
-console.log(`sheet ${sheet.name}`)
-console.log(`rows ${rows}`)
-console.log(`matched ${matched}`)
-console.log(`ratio ${ratio}`)
+if (command === "count") {
+  const matched = matchedRows.length
+  const rows = sheet.rows.length
+  const ratio = rows === 0 ? "0%" : `${((matched / rows) * 100).toFixed(2)}%`
+  console.log(`filters ${wheres.length + anys.length}`)
+  console.log(`sheet ${sheet.name}`)
+  console.log(`rows ${rows}`)
+  console.log(`matched ${matched}`)
+  console.log(`ratio ${ratio}`)
+  process.exit(0)
+}
+
+const tally = new Map()
+for (const row of matchedRows) {
+  for (const name of splitNames(row[topIndex] ?? "")) {
+    tally.set(name, (tally.get(name) ?? 0) + 1)
+  }
+}
+let best = 0
+for (const count of tally.values()) if (count > best) best = count
+const names = [...tally.entries()].filter((entry) => entry[1] === best).map((entry) => entry[0])
+console.log(`top ${names.join("、")}`)
+console.log(`count ${best}`)
 
 function columnIndex(headers, column) {
   const exact = headers.indexOf(column)
@@ -129,6 +160,13 @@ function parseWhere(raw) {
   if (!["empty", "not-empty", "contains", "not-contains", "equals"].includes(op)) fail(`不支持的比较 ${op}`)
   if ((op === "contains" || op === "not-contains" || op === "equals") && expected.length === 0) fail(`${op} 缺少比较文本`)
   return { column, op, expected }
+}
+
+function splitNames(value) {
+  return value
+    .split(/[,，、;；]+/)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
 }
 
 function matchCell(value, where) {

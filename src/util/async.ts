@@ -61,6 +61,52 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+/** Limits how many async tasks run at once; extra callers wait in FIFO order. */
+export class Semaphore {
+  private active = 0
+  private readonly waiters: Array<() => void> = []
+
+  constructor(private readonly max: number) {
+    if (max < 1) throw new Error("Semaphore max must be >= 1")
+  }
+
+  get waiting(): number {
+    return this.waiters.length
+  }
+
+  get inUse(): number {
+    return this.active
+  }
+
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    await this.acquire()
+    try {
+      return await task()
+    } finally {
+      this.release()
+    }
+  }
+
+  private acquire(): Promise<void> {
+    if (this.active < this.max) {
+      this.active++
+      return Promise.resolve()
+    }
+    return new Promise((resolve) => {
+      this.waiters.push(() => {
+        this.active++
+        resolve()
+      })
+    })
+  }
+
+  private release(): void {
+    this.active--
+    const next = this.waiters.shift()
+    if (next) next()
+  }
+}
+
 /** A throttle that coalesces rapid calls into at most one per interval. */
 export function createThrottle(intervalMs: number): (task: () => void) => void {
   let last = 0

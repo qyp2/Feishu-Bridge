@@ -15,7 +15,10 @@ export function isProgressShell(text: string): boolean {
     .replace(/<[^>]+>/g, "")
     .replace(/\*\*/g, "")
     .replace(/[✅❌⏰｜|]/g, "")
-    .replace(/处理完成|解读指令中?|已理解你的指令|正在理解你的指令|整理回复中?|收到，正在生成/g, "")
+    .replace(
+      /处理完成|解读指令中?|已理解你的指令|正在理解你的指令|整理回复中?|收到，正在生成|生成并上传文件中?/g,
+      "",
+    )
     .replace(/\s+/g, "")
   return stripped.length === 0
 }
@@ -171,13 +174,27 @@ export class TurnAccumulator {
    * Live cards show only the layers reached so far. A finished turn keeps those
    * layers and appends the last reply.
    */
-  render(phase: "live" | "done" = "done"): string {
+  render(phase: "live" | "done" = "done", postPhase?: TurnPostPhase): string {
     const parts: string[] = []
     const tools = this.showTools ? visibleTools(this.tools) : []
     const busy = tools.some((tool) => tool.status !== "completed" && tool.status !== "error")
     const waiting = phase === "live" && Boolean(nextStage(this.lastText, tools))
-    if (this.showTools) parts.push(renderLayers(buildLayers(tools, this.fileNames, phase, this.lastText), this.titlePrefix))
-    if (!busy && !waiting) {
+    if (this.showTools) {
+      parts.push(renderLayers(buildLayers(tools, this.fileNames, phase, this.lastText, postPhase), this.titlePrefix))
+    } else if (phase === "done" && postPhase === "office-pending") {
+      parts.push(
+        renderLayers(
+          [
+            { title: "解读指令", detail: "已理解你的指令", status: "completed" },
+            { title: "生成并上传文件中", detail: "正在把成品发送到本会话，请稍候", status: "running" },
+          ],
+          this.titlePrefix,
+        ),
+      )
+    }
+    // A finished turn always keeps the written answer. A stale "running" flag
+    // must not leave the chat with only the progress line.
+    if (phase === "done" || (!busy && !waiting)) {
       const answer = this.lastText
       if (answer) parts.push(answer)
     }
@@ -212,25 +229,36 @@ interface ProgressLayer {
 }
 
 const LAYER_COPY: Record<string, { agent: string; title: string; running: string; done: string; hints: RegExp }> = {
-  "调用 A11 需求": { agent: "pm-a11-requirements", title: "梳理需求", running: "正在整理需求范围和验收标准", done: "需求已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a11|梳理需求/i },
-  "调用 A12 竞品": { agent: "pm-a12-competitor", title: "梳理竞品", running: "正在对照竞品和差异点", done: "竞品已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a12|梳理竞品/i },
-  "调用 A13 市场": { agent: "pm-a13-market", title: "梳理市场", running: "正在整理市场规模、竞争和机会", done: "市场判断已经完成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a13|梳理市场/i },
-  "调用 A21 研发": { agent: "pm-a21-rd", title: "梳理研发", running: "正在整理研发路径", done: "研发判断已经完成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a21|梳理研发/i },
-  "调用 A22 测试": { agent: "pm-a22-qa", title: "梳理测试", running: "正在整理测试范围", done: "测试判断已经完成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a22|梳理测试/i },
-  "调用 A23 发布": { agent: "pm-a23-release", title: "梳理发布", running: "正在整理发布安排", done: "发布判断已经完成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a23|梳理发布/i },
-  "调用 A31 运营": { agent: "pm-a31-ops", title: "梳理运营", running: "正在整理运营动作", done: "运营判断已经完成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a31|梳理运营/i },
-  "调用 A32 反馈": { agent: "pm-a32-feedback", title: "梳理反馈", running: "正在整理反馈和问题", done: "反馈已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a32|梳理反馈/i },
-  "调用 A41 线索": { agent: "pm-a41-leads", title: "梳理线索", running: "正在整理线索来源", done: "线索已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a41|梳理线索/i },
-  "调用 A42 跟进": { agent: "pm-a42-followup", title: "梳理跟进", running: "正在整理跟进动作", done: "跟进已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a42|梳理跟进/i },
-  "调用 A43 正文": { agent: "pm-a43-conversion", title: "撰写正文", running: "正在按材料和前序结论组织正文", done: "正文已经写好", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a43|撰写正文/i },
-  "调用 A44 业绩": { agent: "pm-a44-performance", title: "梳理业绩", running: "正在整理业绩数据", done: "业绩已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a44|梳理业绩/i },
-  "调用 A51 支持": { agent: "pm-a51-support", title: "梳理支持", running: "正在整理支持方案", done: "支持方案已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a51|梳理支持/i },
-  "调用 A52 知识": { agent: "pm-a52-knowledge", title: "梳理知识", running: "正在整理可复用的知识点", done: "知识已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a52|梳理知识/i },
-  "调用 A53 伙伴": { agent: "pm-a53-partner", title: "梳理伙伴", running: "正在整理合作伙伴", done: "伙伴判断已经完成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a53|梳理伙伴/i },
-  "调用 A54 风险": { agent: "pm-a54-risk", title: "梳理风险", running: "正在整理风险和应对", done: "风险判断已经完成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a54|梳理风险/i },
-  "调用 A81 商机": { agent: "pm-a81-opportunity", title: "商机雷达", running: "正在多角度搜索展会与资讯", done: "商机推荐已经生成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a81|商机|展会|活动推荐|行业资讯/i },
-  "调用 A61 成稿": { agent: "pm-a61-deliverable", title: "套模板成稿", running: "正在套用模板并生成文件", done: "文件已经生成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a61|(?:调用|开始|进入|发起)[^。\n]{0,12}成稿|套模板成稿/i },
+  "调用 A11 需求": { agent: "pm-a11-requirements", title: "梳理需求", running: "正在整理需求范围和验收标准", done: "需求已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a11\b/i },
+  "调用 A12 竞品": { agent: "pm-a12-competitor", title: "梳理竞品", running: "正在对照竞品和差异点", done: "竞品已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a12\b/i },
+  "调用 A13 市场": { agent: "pm-a13-market", title: "梳理市场", running: "正在整理市场规模、竞争和机会", done: "市场判断已经完成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a13\b/i },
+  "调用 A21 研发": { agent: "pm-a21-rd", title: "梳理研发", running: "正在整理研发路径", done: "研发判断已经完成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a21\b/i },
+  "调用 A22 测试": { agent: "pm-a22-qa", title: "梳理测试", running: "正在整理测试范围", done: "测试判断已经完成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a22\b/i },
+  "调用 A23 发布": { agent: "pm-a23-release", title: "梳理发布", running: "正在整理发布安排", done: "发布判断已经完成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a23\b/i },
+  "调用 A24 上会审核": { agent: "pm-a24-review-meeting", title: "上会材料审核", running: "正在对照清单审阅材料", done: "上会审核已经完成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a24\b/i },
+  "调用 A31 运营": { agent: "pm-a31-ops", title: "梳理运营", running: "正在整理运营动作", done: "运营判断已经完成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a31\b/i },
+  "调用 A32 反馈": { agent: "pm-a32-feedback", title: "梳理反馈", running: "正在整理反馈和问题", done: "反馈已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a32\b/i },
+  "调用 A41 线索": { agent: "pm-a41-leads", title: "梳理线索", running: "正在整理线索来源", done: "线索已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a41\b/i },
+  "调用 A42 跟进": { agent: "pm-a42-followup", title: "梳理跟进", running: "正在整理跟进动作", done: "跟进已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a42\b/i },
+  "调用 A43 正文": { agent: "pm-a43-conversion", title: "撰写正文", running: "正在按材料和前序结论组织正文", done: "正文已经写好", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a43\b/i },
+  "调用 A44 业绩": { agent: "pm-a44-performance", title: "梳理业绩", running: "正在整理业绩数据", done: "业绩已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a44\b/i },
+  "调用 A51 支持": { agent: "pm-a51-support", title: "梳理支持", running: "正在整理支持方案", done: "支持方案已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a51\b/i },
+  "调用 A52 知识": { agent: "pm-a52-knowledge", title: "梳理知识", running: "正在整理可复用的知识点", done: "知识已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a52\b/i },
+  "调用 A53 伙伴": { agent: "pm-a53-partner", title: "梳理伙伴", running: "正在整理合作伙伴", done: "伙伴判断已经完成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a53\b/i },
+  "调用 A54 风险": { agent: "pm-a54-risk", title: "梳理风险", running: "正在整理风险和应对", done: "风险判断已经完成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a54\b/i },
+  "调用 A81 商机": { agent: "pm-a81-opportunity", title: "商机雷达", running: "正在多角度搜索展会与资讯", done: "商机推荐已经生成", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a81\b/i },
+  "调用 A64 邮件": { agent: "pm-a64-mail", title: "查收邮件", running: "正在读取邮箱并整理", done: "邮件已经整理完", hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a64\b/i },
+  "调用 A61 成稿": {
+    agent: "pm-a61-deliverable",
+    title: "套模板成稿",
+    running: "正在套用模板并生成文件",
+    done: "成稿 Agent 已完成（文件由下一步上传）",
+    hints: /(?:调用|开始|进入|发起)\s*(?:pm-)?a61|(?:调用|开始|进入|发起)[^。\n]{0,12}成稿|套模板成稿/i,
+  },
 }
+
+/** After agents finish, Bridge may still build office files and upload to Feishu. */
+export type TurnPostPhase = "office-pending"
 
 /**
  * A placeholder promise is short, mentions ongoing work ("正在检索…整理好就
@@ -259,7 +287,13 @@ function nextStage(text: string, tools: ToolState[]): { agent: string; title: st
   return chosen
 }
 
-function buildLayers(tools: ToolState[], fileNames: string[], phase: "live" | "done", text: string): ProgressLayer[] {
+function buildLayers(
+  tools: ToolState[],
+  fileNames: string[],
+  phase: "live" | "done",
+  text: string,
+  postPhase?: TurnPostPhase,
+): ProgressLayer[] {
   const interpreted = tools.length > 0 || phase === "done" || text.length > 0
   const withFiles = fileNames.length > 0
   const layers: ProgressLayer[] = [
@@ -295,6 +329,13 @@ function buildLayers(tools: ToolState[], fileNames: string[], phase: "live" | "d
   } else if (phase === "live" && tools.length > 0 && !busy) {
     layers.push({ title: "整理回复中", detail: "正在把这一轮的结果写成回复", status: "running" })
   }
+  if (phase === "done" && postPhase === "office-pending") {
+    layers.push({
+      title: "生成并上传文件中",
+      detail: "正在把 PPT/文档 生成并发送到你的会话（通常还需几秒到一分钟）",
+      status: "running",
+    })
+  }
   return layers
 }
 
@@ -320,14 +361,20 @@ function layerHeadline(layers: ProgressLayer[]): string {
 
 function renderLayers(layers: ProgressLayer[], titlePrefix = ""): string {
   const bars = barFrame()
+  const spin = spinnerFrame()
+  const pulse = pulseFrame()
   const headline = layerHeadline(layers)
+  const running = layers.some((layer) => layer.status === "running")
   const lines = [`**${titlePrefix ? `${titlePrefix}｜` : ""}${headline}**`, ""]
   for (const layer of layers) {
     if (layer.status === "completed") lines.push(`<font color='green'>✅</font> **${layer.title}**`)
     else if (layer.status === "error") lines.push(`<font color='red'>❌</font> **${layer.title}**`)
-    else lines.push(`<font color='green'>${bars}</font> **${layer.title}**`)
+    else lines.push(`<font color='green'>${bars}</font> **${layer.title}** <font color='grey'>${spin}</font>`)
     lines.push(`<font color='grey'>｜ ${layer.detail}</font>`)
     lines.push("")
+  }
+  if (running) {
+    lines.push(`<font color='grey'>${pulse} 生产中 ${spin}</font>`)
   }
   return lines.join("\n").trim()
 }
@@ -356,16 +403,22 @@ function statusRank(status: string): number {
 }
 
 const SPINNER = ["◐", "◓", "◑", "◒"]
-const BARS = ["▍", "▍▍", "▍▍▍"]
+const BARS = ["▏", "▎", "▍", "▌", "▋", "▊", "▉", "█", "▉", "▊", "▋", "▍"]
+const PULSE = ["·", "••", "•••", "····", "•••", "••"]
 
 /** Frame of the in-progress mark. Advances about once per card refresh. */
 export function spinnerFrame(now = Date.now()): string {
   return SPINNER[Math.floor(now / 700) % SPINNER.length] ?? "◐"
 }
 
-/** Three rising bars for the layer that is still working. */
+/** Rising/falling bar for the layer that is still working. */
 function barFrame(now = Date.now()): string {
-  return BARS[Math.floor(now / 700) % BARS.length] ?? "▍"
+  return BARS[Math.floor(now / 450) % BARS.length] ?? "▍"
+}
+
+/** Trailing dots under the layer list while production is still running. */
+function pulseFrame(now = Date.now()): string {
+  return PULSE[Math.floor(now / 550) % PULSE.length] ?? "···"
 }
 
 /** Keep one card element under Feishu's size limit so updates are not split into new cards. */

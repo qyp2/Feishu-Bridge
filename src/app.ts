@@ -14,6 +14,7 @@ import { MailWatcher } from "./scheduler/mailwatch.js"
 import { MailBindingStore } from "./mail/binding.js"
 import { MailProxy } from "./mail/proxy.js"
 import { HealthMonitor } from "./monitor/health.js"
+import { StudioService } from "./studio/service.js"
 
 /**
  * Wires all subsystems together and owns their lifecycle.
@@ -34,6 +35,7 @@ export class App {
   private readonly mailProxy: MailProxy
   private readonly health: HealthMonitor
   private readonly janitor: Janitor
+  private readonly studio: StudioService
   private started = false
 
   constructor(loaded: LoadedConfig) {
@@ -46,6 +48,7 @@ export class App {
     this.service = new OpencodeService(config.opencode, this.logger.child("opencode"))
     this.eventBus = new OpencodeEventBus(this.service, this.logger.child("events"))
     this.bindings = new BindingStore(this.storageDir)
+    this.studio = new StudioService(this.storageDir)
 
     this.conversations = new ConversationService({
       config,
@@ -69,7 +72,9 @@ export class App {
         this.conversations.completeGapFill(bot, token, answers, messageId),
       // Resolved lazily: the cron manager is constructed a few lines below.
       getCron: () => this.cron,
+      getIntel: () => this.cron?.intel,
       getMailBinding: () => this.mailBinding,
+      studio: this.studio,
     })
 
     this.cron = new CronManager({
@@ -78,6 +83,7 @@ export class App {
       logger: this.logger.child("cron"),
       audit: this.audit,
       storageDir: this.storageDir,
+      getMailBinding: () => this.mailBinding,
     })
 
     this.mailBinding = new MailBindingStore(this.storageDir)
@@ -111,6 +117,7 @@ export class App {
     this.conversations.commandHandler.setFormAnswerHandler(this.interactions)
     this.conversations.commandHandler.setCronController(this.cron)
     this.conversations.commandHandler.setMailBindingStore(this.mailBinding)
+    this.conversations.commandHandler.setStudioService(this.studio)
     this.conversations.setMailBinding(this.mailBinding)
     this.conversations.setInteractionProbe((sessionID) => this.interactions.hasPending(sessionID))
 

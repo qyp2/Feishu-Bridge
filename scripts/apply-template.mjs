@@ -42,9 +42,11 @@ export async function fillTemplate({ templatePath, outPath, markdown, title, pag
   const relationships = []
   const overrides = []
   const titles = []
+  const built = []
   let index = 1
 
   const push = (xml, rel, label) => {
+    built.push(xml)
     zip.file(`ppt/slides/slide${index}.xml`, acceptSlide(xml, size))
     zip.file(`ppt/slides/_rels/slide${index}.xml.rels`, relsForSlide(rel, xml, zip))
     slideIds.push(`<p:sldId id="${256 + index}" r:id="rId${nextRel}"/>`)
@@ -68,11 +70,24 @@ export async function fillTemplate({ templatePath, outPath, markdown, title, pag
     }
     push(fillToc(roles.toc.xml, labels), roles.toc.rels, "目录")
   }
-  contentPages.forEach((page, pageIndex) => {
+  const layoutCache = new Map()
+  const readLayout = async (layoutFile) => {
+    if (!layoutFile) return ""
+    if (layoutCache.has(layoutFile)) return layoutCache.get(layoutFile)
+    const xml = zip.file(layoutFile) ? await zip.file(layoutFile).async("string") : ""
+    layoutCache.set(layoutFile, xml)
+    return xml
+  }
+  for (let pageIndex = 0; pageIndex < contentPages.length; pageIndex += 1) {
+    const page = contentPages[pageIndex]
     const background = backgrounds[pageIndex % backgrounds.length]
-    push(fillContent(background.xml, page, box, size), background.rels, page.title)
-  })
+    const lay = (await readLayout(background.layoutFile)) || layoutXml
+    const pageBox = contentBox(lay, size)
+    push(fillContent(background.xml, page, pageBox, size, lay), background.rels, page.title)
+  }
   if (roles.ending) push(fillEnding(roles.ending.xml), roles.ending.rels, "谢谢")
+  const foreign = foreignSample(slides, markdown ?? "", built)
+  if (foreign.length > 0) throw new Error(`套版残留：${foreign.slice(0, 8).join("、")}`)
 
   zip.file(
     "ppt/presentation.xml",
@@ -121,7 +136,7 @@ export function pagesFromMarkdown(markdown) {
     if (!current) {
       if (!line.trim()) continue
       if (!title) title = cleanInline(line)
-      else current = { heading: title, lines: [line] }
+      else current = { heading: "概述", lines: [line] }
       continue
     }
     current.lines.push(line)
@@ -136,7 +151,99 @@ export function pagesFromMarkdown(markdown) {
   if (resolved.length === 0) {
     resolved.push({ heading: title || "正文", pieces: [{ role: "body", text: clean(markdown) || "未提供" }], tables: [], charts: [] })
   }
-  return { title: title || resolved[0].heading, sections: resolved }
+  for (const section of resolved) {
+    const display = splitHeading(section.heading)
+    if (display.lead && !section.pieces.some((piece) => piece.text === display.lead)) {
+      section.pieces.unshift({ role: "subtitle", text: display.lead })
+    }
+    section.heading = display.title
+  }
+  const deckTitle = title || resolved[0]?.heading || ""
+  polishSections(resolved, deckTitle, String(markdown ?? ""))
+  return { title: deckTitle || "文档", sections: resolved }
+}
+
+/** Drop reasoning labels the model copies from its own instructions. */
+function stripCue(text) {
+  return clean(text).replace(/^.{0,16}判断[：:]\s*/, "").trim()
+}
+
+function polishSections(sections, title, markdown) {
+  const pitch = /商业计划/.test(title) && !/请示/.test(title)
+  for (const section of sections) {
+    section.pieces = section.pieces
+      .map((piece) => ({ ...piece, text: stripCue(piece.text) }))
+      .filter((piece) => piece.text)
+    if (pitch) {
+      section.pieces = section.pieces.map((piece) => ({
+        ...piece,
+        text: piece.text.replace(/是否同意以上产品方案？\s*请领导批示。?/g, "以上为产品方案，提请评审。"),
+      }))
+    }
+  }
+  attachForecast(sections, markdown)
+}
+
+function attachForecast(sections, markdown) {
+  const target = sections.find((section) => /投入产出|财务测算|三年/.test(section.heading))
+  if (!target || target.tables.length > 0) return
+  const blob = target.pieces.map((piece) => piece.text).join("")
+  if (blob && !/未提供|不作为本次/.test(blob)) return
+  const prices = [...markdown.matchAll(/\$?\s*(\d+(?:\.\d+)?)\s*(?:HKD|港元)?\s*\/\s*月/gi)]
+    .map((match) => Number(match[1]))
+    .filter((price) => price > 0)
+  if (prices.length === 0) return
+  const low = Math.min(...prices)
+  const high = Math.max(...prices)
+  const userMatch = /([\d.]+)\s*万(?:订购)?用户|订购用户[^\d]{0,8}([\d.]+)\s*万/.exec(markdown)
+  const usersWan = userMatch ? Number(userMatch[1] || userMatch[2]) : 0
+  const assumed = !(usersWan > 0)
+  const scales = assumed ? [1, 3, 5] : [usersWan]
+  const money = (wan, price) => {
+    const amount = wan * 10000 * price * 12
+    const asWan = amount / 10000
+    return asWan >= 10000 ? `${Math.round(asWan / 100) / 100}亿HKD` : `${Math.round(asWan)}万HKD`
+  }
+  target.pieces = [{
+    role: "body",
+    text: assumed
+      ? "资料没有在网用户数。下表按资费区间做三档规模假设，年收入＝在网用户×月费×12，属【假设】，不作为批示依据。"
+      : `按资料中的 ${usersWan} 万用户与资费区间估算年收入，属【预估】，不作为批示依据。`,
+  }]
+  target.tables = [[
+    ["在网规模", "月费低档", "月费高档", "年收入低档", "年收入高档"],
+    ...scales.map((wan) => [
+      `${wan}万${assumed ? "【假设】" : "【预估】"}`,
+      `${low}HKD/月`,
+      `${high}HKD/月`,
+      money(wan, low),
+      money(wan, high),
+    ]),
+  ]]
+}
+
+function talkingPoints(pieces) {
+  const points = []
+  for (const piece of pieces ?? []) {
+    const text = stripCue(piece.text)
+    if (!text) continue
+    if (text.length <= 70) {
+      points.push(text)
+      continue
+    }
+    const parts = text.split(/(?<=[。！？；])/).map((part) => part.trim()).filter(Boolean)
+    if (parts.length <= 1) points.push(text)
+    else points.push(...parts)
+  }
+  return points
+}
+
+/** 目录和页标题用短章节名。结论句留在正文，避免被目录槽位截断。 */
+function splitHeading(heading) {
+  const text = clean(heading).replace(/（续）$/, "").trim()
+  const paren = /[（(]([^）)]{2,12})[）)]\s*$/.exec(text)
+  if (!paren) return { title: text || "正文", lead: "" }
+  return { title: paren[1], lead: text.slice(0, paren.index).trim() }
 }
 
 /** External callers may hand over ready-made pages instead of markdown. */
@@ -171,12 +278,27 @@ function layoutPages(sections, box) {
       pages.push({ title: titleFor(), pieces: [{ role: "body", text: "未提供" }], table: null, chart: null, scale: 1 })
       continue
     }
-    for (const group of packPieces(section.pieces, box)) {
-      pages.push({ title: titleFor(), pieces: group.pieces, table: null, chart: null, scale: group.scale })
+    const points = talkingPoints(section.pieces)
+    const captionWithTable = section.tables.length === 1 && section.charts.length === 0 && points.length > 0 && points.length <= 2 && points.every((text) => text.length <= 80)
+    if (captionWithTable) {
+      pages.push({ title: titleFor(), pieces: points.map((text) => ({ role: "body", text })), table: section.tables[0], chart: null, scale: 1 })
+    } else if (points.length > 0) {
+      for (let start = 0; start < points.length; start += 4) {
+        const group = points.slice(start, start + 4)
+        pages.push({ title: titleFor(), pieces: group.map((text) => ({ role: "body", text })), table: null, chart: null, scale: 1 })
+      }
     }
-    for (const table of section.tables) {
+    for (const table of captionWithTable ? [] : section.tables) {
+      if (valuesArePlaceholder(table)) {
+        noteOnPage(pages, heading, "本项材料未提供数字，不作为本次批示依据。")
+        continue
+      }
       const visual = visualizeTable(table, lastChart)
       if (visual) {
+        if (isTrivialChart(visual)) {
+          noteOnPage(pages, heading, seriesNote(visual))
+          continue
+        }
         lastChart = visual.type
         pages.push({ title: titleFor(), pieces: [], table: null, chart: visual, scale: 1 })
         continue
@@ -186,12 +308,73 @@ function layoutPages(sections, box) {
       }
     }
     for (const chart of section.charts) {
+      if (isTrivialChart(chart)) {
+        noteOnPage(pages, heading, seriesNote(chart))
+        continue
+      }
       lastChart = chart.type
       pages.push({ title: titleFor(), pieces: [], table: null, chart, scale: 1 })
     }
   }
   if (pages.length === 0) pages.push({ title: "正文", pieces: [{ role: "body", text: "未提供" }], table: null, chart: null, scale: 1 })
   return pages.slice(0, 48)
+}
+
+function noteOnPage(pages, heading, text) {
+  const note = clean(text)
+  if (!note) return
+  const prev = pages[pages.length - 1]
+  const same = prev && clean(prev.title).replace(/（续）$/, "") === heading
+  if (same && Array.isArray(prev.pieces) && !prev.table && !prev.chart) {
+    prev.pieces.push({ role: "body", text: note })
+    return
+  }
+  pages.push({ title: heading, pieces: [{ role: "body", text: note }], table: null, chart: null, scale: 1 })
+}
+
+function valuesArePlaceholder(table) {
+  if (!Array.isArray(table) || table.length < 2) return false
+  const values = table.slice(1).flatMap((row) => row.slice(1)).map((cell) => clean(cell)).filter(Boolean)
+  if (values.length === 0) return true
+  return values.every((cell) => /^【(?:待确认|假设)】$/.test(cell) || cell === "待确认")
+}
+
+function isTrivialChart(chart) {
+  const series = chartSeries(chart?.rows ?? [])
+  if (series.length !== 2) return false
+  const blob = series.map((item) => `${item.label}${item.display}`).join("")
+  if (/%|％|万|亿/.test(blob)) return false
+  return series.every((item) => Number.isInteger(item.value) && item.value >= 0 && item.value <= 24)
+}
+
+function seriesNote(chart) {
+  return chartSeries(chart?.rows ?? [])
+    .map((item) => `${item.label}：${item.display || item.value}`)
+    .join("；")
+}
+
+const SAMPLE_KEEP = /^(目录|谢谢|谢谢聆听|感谢|感谢聆听|→|中国移动|中国移动通信)$/
+
+function textRuns(xml) {
+  return [...String(xml).matchAll(/<a:t[^>]*>([^<]*)<\/a:t>/g)].map((match) => decodeXml(match[1] ?? "").replace(/\s+/g, ""))
+}
+
+function foreignSample(templateSlides, markdown, outputs) {
+  const source = String(markdown).replace(/\s+/g, "")
+  const phrases = new Set()
+  for (const slide of templateSlides) {
+    for (const compact of textRuns(slide.xml)) {
+      if (compact.length < 4 || SAMPLE_KEEP.test(compact) || /^\d+$/.test(compact)) continue
+      if (source.includes(compact)) continue
+      phrases.add(compact)
+    }
+  }
+  const output = outputs.flatMap((xml) => textRuns(xml))
+  const hits = []
+  for (const phrase of phrases) {
+    if (output.some((text) => text.includes(phrase))) hits.push(phrase)
+  }
+  return hits
 }
 
 /** Estimated width of a string in thousandths of the font size. */
@@ -201,8 +384,27 @@ function textUnits(text) {
   return units
 }
 
+/** Height of wrapped text plus the padding plainText already leaves inside the box. */
+function blockHeight(text, widthEmu, fontHundredths) {
+  const size = fontHundredths * 127
+  const inner = Math.max(widthEmu - 480000, 600000)
+  const lines = Math.max(Math.ceil(((textUnits(text) / 1000) * size) / inner), 1)
+  return Math.round(lines * size * 1.45) + 220000
+}
+
+/** Largest size that stays inside the box. The box is then that tall, so text cannot cover the next row. */
+function fitBlock(text, widthEmu, maxHeight, preferred) {
+  let size = preferred
+  let height = blockHeight(text, widthEmu, size)
+  while (height > maxHeight && size > 1400) {
+    size -= 100
+    height = blockHeight(text, widthEmu, size)
+  }
+  return { size, height: Math.min(Math.max(height, 520000), maxHeight) }
+}
+
 function estimatePieceHeight(piece, cx) {
-  const fontPt = piece.role === "subtitle" ? 19 : 15
+  const fontPt = piece.role === "subtitle" ? 22 : 18
   const size = fontPt * 12700
   const lineWidth = Math.max(cx - 260000, 1200000)
   const textW = (textUnits(piece.text) / 1000) * size
@@ -213,7 +415,8 @@ function estimatePieceHeight(piece, cx) {
 }
 
 function packPieces(pieces, box) {
-  const list = pieces.length > 0 ? pieces : [{ role: "body", text: "未提供" }]
+  if (pieces.length === 0) return []
+  const list = pieces
   const budget = Math.round(box.cy * 0.96)
   const groups = []
   let current = []
@@ -237,7 +440,7 @@ function packPieces(pieces, box) {
 }
 
 function estimateRowHeight(row, columns, header) {
-  const size = 12 * 12700
+  const size = 15 * 12700
   let lines = 1
   row.forEach((cellText, index) => {
     const width = Math.max((columns[index] ?? columns[0] ?? 2000000) - 140000, 300000)
@@ -373,12 +576,25 @@ async function readSlides(zip) {
 }
 
 function classifySlides(slides) {
-  const cover = slides.find((slide) => /模版|模板/.test(slide.text)) ?? slides[0]
+  const cover =
+    slides.find((slide) => /模版|模板|内部汇报/.test(slide.text)) ??
+    slides.find((slide) => /商业计划|计划书|汇报/.test(slide.text) && slide.index <= 2) ??
+    slides[0]
   const toc = slides.find((slide) => slide !== cover && /目录/.test(slide.text))
-  const content = slides.find((slide) => slide !== cover && slide !== toc && clean(slide.text).length === 0)
-  let ending = [...slides].reverse().find((slide) => slide !== cover && slide !== toc && slide !== content && PLACEHOLDER_TEXT.test(plain(slide.text)))
+  const content = slides.find(
+    (slide) => slide !== cover && slide !== toc && clean(slide.text).length === 0 && !/<p:ph\b/.test(slide.xml),
+  )
+  let ending = [...slides].reverse().find(
+    (slide) =>
+      slide !== cover &&
+      slide !== toc &&
+      slide !== content &&
+      (PLACEHOLDER_TEXT.test(plain(slide.text)) || /^(谢谢聆听|谢谢|感谢)/.test(plain(slide.text))),
+  )
   if (!ending) {
-    ending = [...slides].reverse().find((slide) => slide !== cover && slide !== toc && slide !== content && /^(谢谢|感谢)/.test(plain(slide.text)))
+    ending = [...slides].reverse().find(
+      (slide) => slide !== cover && slide !== toc && slide !== content && /^(谢谢|感谢)/.test(plain(slide.text)),
+    )
   }
   return { cover, toc, content, ending }
 }
@@ -405,10 +621,28 @@ function contentBackgrounds(slides, roles) {
   if (picks.length === 0 && roles.cover) {
     return [{ xml: shellXml(roles.cover.xml), rels: roles.cover.rels, layoutFile: roles.cover.layoutFile }]
   }
-  return picks.map((list) => {
-    const slide = [...list].sort((a, b) => clean(a.text).length - clean(b.text).length)[0]
-    return { xml: shellXml(slide.xml), rels: slide.rels, layoutFile: slide.layoutFile }
+  const shells = picks.map((list) => {
+    const slide = [...list].sort((a, b) => textCapacity(b) - textCapacity(a))[0]
+    return { xml: shellXml(slide.xml), rels: slide.rels, layoutFile: slide.layoutFile, cap: textCapacity(slide) }
   })
+  const best = Math.max(...shells.map((shell) => shell.cap))
+  const usable = shells.filter((shell) => shell.cap >= best * 0.65)
+  return (usable.length > 0 ? usable : shells.slice(0, 1)).map(({ xml, rels, layoutFile }) => ({ xml, rels, layoutFile }))
+}
+
+/** Prefer the shell whose text boxes can actually hold a title plus body. */
+function textCapacity(slide) {
+  let area = 0
+  for (const match of slide.xml.matchAll(/<p:sp\b[\s\S]*?<\/p:sp>/g)) {
+    if (!/<(?:a|p):txBody\b/.test(match[0])) continue
+    const ext = /<a:ext cx="(\d+)" cy="(\d+)"\/>/.exec(match[0])
+    if (!ext) continue
+    const cx = Number(ext[1])
+    const cy = Number(ext[2])
+    if (cx < 400000 || cy < 80000) continue
+    area += cx * cy
+  }
+  return area
 }
 
 function shortestText(slides) {
@@ -423,11 +657,32 @@ function mediaKey(rels) {
   return images.join("|") || "plain"
 }
 
-/** Keep the background pictures. Drop the sample deck's words and charts. */
+/** Keep background art and text-box geometry; clear sample words/charts so in-place fill keeps template styles. */
 function shellXml(xml) {
   return xml
     .replace(/<p:graphicFrame\b[\s\S]*?<\/p:graphicFrame>/g, "")
-    .replace(/<p:sp\b[\s\S]*?<\/p:sp>/g, (shape) => (/<a:t[\s>]/.test(shape) ? "" : shape))
+    .replace(/<p:sp\b[\s\S]*?<\/p:sp>/g, (shape) => {
+      if (!/<(?:a|p):txBody\b/.test(shape)) return shape
+      if (/<p:ph\b[^>]*type="(?:dt|ftr|sldNum)"/.test(shape)) return shape
+      return clearShapeText(shape)
+    })
+}
+
+function txBodyChrome(txBody) {
+  const bodyPr = txBody.match(/<a:bodyPr\b[^>]*\/>/)?.[0]
+    ?? txBody.match(/<a:bodyPr\b[^>]*>[\s\S]*?<\/a:bodyPr>/)?.[0]
+    ?? '<a:bodyPr anchor="t" wrap="square"/>'
+  const lst = txBody.match(/<a:lstStyle\b[^>]*\/>/)?.[0]
+    ?? txBody.match(/<a:lstStyle\b[^>]*>[\s\S]*?<\/a:lstStyle>/)?.[0]
+    ?? "<a:lstStyle/>"
+  return { bodyPr, lst }
+}
+
+function clearShapeText(shape) {
+  return shape.replace(/<(a|p):txBody\b[^>]*>[\s\S]*?<\/\1:txBody>/g, (txBody, ns) => {
+    const { bodyPr, lst } = txBodyChrome(txBody)
+    return `<${ns}:txBody>${bodyPr}${lst}<a:p><a:endParaRPr lang="zh-CN"/></a:p></${ns}:txBody>`
+  })
 }
 
 function plain(value) {
@@ -435,27 +690,60 @@ function plain(value) {
 }
 
 function fillCover(xml, title) {
-  let done = false
-  return xml.replace(/<p:sp>[\s\S]*?<\/p:sp>/g, (shape) => {
-    const text = slideText(shape)
-    if (!done && (/模版|模板/.test(text) || /name="[^"]*标题/.test(shape))) {
-      done = true
-      return replaceFirstRun(shape, title)
-    }
-    return shape.replace(/<a:t([^>]*)>XXX<\/a:t>/g, "<a:t$1></a:t>")
+  const product = productName(title)
+  const kind = docKind(title)
+  const ranked = []
+  xml.replace(/<p:sp\b[\s\S]*?<\/p:sp>/g, (shape) => {
+    if (!/<(?:a|p):txBody\b/.test(shape) || !slideText(shape).trim()) return shape
+    const sizes = [...shape.matchAll(/sz="(\d+)"/g)].map((match) => Number(match[1]))
+    ranked.push({ shape, size: sizes.length > 0 ? Math.max(...sizes) : 0 })
+    return shape
   })
+  ranked.sort((a, b) => b.size - a.size)
+  let next = xml
+  ranked.forEach((item, index) => {
+    const replacement = index === 0 ? replaceFirstRun(item.shape, product || title) : index === 1 ? replaceFirstRun(item.shape, kind) : clearShapeText(item.shape)
+    next = next.replace(item.shape, replacement)
+  })
+  return next
+}
+
+function productName(title) {
+  const text = clean(title)
+  const quoted = /《([^》]{1,40})》/.exec(text)
+  if (quoted) return quoted[1]
+  return text
+    .replace(/^关于开展/, "")
+    .replace(/产品标准化工作的请示$/, "")
+    .replace(/商业计划书$/, "")
+    .replace(/产品退出评审$/, "")
+    .replace(/的请示$/, "")
+    .trim() || text || "文档"
+}
+
+function docKind(title) {
+  const text = clean(title)
+  if (/退出/.test(text)) return "产品退出评审"
+  if (/请示|标准化/.test(text)) return "产品化请示"
+  if (/商业计划/.test(text)) return "商业计划书"
+  return "汇报"
 }
 
 function fillToc(xml, labels) {
   const rebuilt = rebuildToc(xml, labels)
-  if (rebuilt) return rebuilt
-  if (!/>XXX</.test(xml)) return fillNumberedToc(xml, labels)
-  let slot = 0
-  return xml.replace(/<a:t([^>]*)>XXX<\/a:t>/g, (full, attrs) => {
-    const label = labels[slot] ?? ""
-    slot += 1
-    return `<a:t${attrs}>${escapeXml(label)}</a:t>`
-  })
+  let filled = rebuilt
+  if (!filled) {
+    if (!/>XXX</.test(xml)) filled = fillNumberedToc(xml, labels)
+    else {
+      let slot = 0
+      filled = xml.replace(/<a:t([^>]*)>XXX<\/a:t>/g, (full, attrs) => {
+        const label = labels[slot] ?? ""
+        slot += 1
+        return `<a:t${attrs}>${escapeXml(label)}</a:t>`
+      })
+    }
+  }
+  return filled.replace(/<p:sp\b[\s\S]*?<\/p:sp>/g, (shape) => (slideText(shape).replace(/\s+/g, "") === "→" ? "" : shape))
 }
 
 /**
@@ -480,7 +768,11 @@ function rebuildToc(xml, labels) {
     ? (child) => child.tag === "sp" && />XXX</.test(child.xml)
     : (child) => child.tag === "sp" && isTocTextLabel(nodeText(child))
   const slotCount = labelBox.node.children.filter(isLabel).length
-  if (slotCount === 0 || slotCount === count) return null
+  if (slotCount === 0) return null
+  // A scaled group stores rows in its own tiny coordinates. Moving those
+  // numbers as if they were slide units pulls the badge off the pill.
+  if (slotCount !== count && childSpaceGroup(labelBox.node)) return paintGroupedToc(xml, labelBox.node, labels)
+  if (slotCount === count) return null
   const numberBox = findNumberContainer(root, labelBox.node)
   const labelRows = clusterTocRows(labelBox.node, isLabel, numberBox)
   if (!labelRows) return null
@@ -571,6 +863,11 @@ function nodeCy(node) {
   return ext ? Number(ext[2]) : 0
 }
 
+function isTocOrnament(node) {
+  const text = nodeText(node).replace(/\s+/g, "")
+  return text === "目录" || text === "→" || /^contents$/i.test(text)
+}
+
 function isTocTextLabel(text) {
   const value = text.trim()
   return value.length > 0 && !/^\d{2}$/.test(value) && value !== "→" && !/^(目录|contents)$/i.test(value)
@@ -615,7 +912,7 @@ function clusterTocRows(container, isAnchor, exclude) {
   const rows = anchors.map((anchor) => ({ anchor, members: [anchor] }))
   const spacing = anchors.length > 1 ? Math.abs(nodeY(anchors[1]) - nodeY(anchors[0])) : 900000
   for (const child of container.children) {
-    if (isAnchor(child) || child === exclude || child.tag === "pic") continue
+    if (isAnchor(child) || child === exclude || child.tag === "pic" || isTocOrnament(child)) continue
     if (nodeY(child) === null) continue
     const center = nodeY(child) + nodeCy(child) / 2
     let best = null
@@ -628,29 +925,179 @@ function clusterTocRows(container, isAnchor, exclude) {
         best = row
       }
     }
-    if (best && bestDist <= Math.max(spacing * 0.6, 300000)) best.members.push(child)
+    if (!best) continue
+    const anchorLeft = nodeX(best.anchor)
+    if (nodeX(child) + nodeCx(child) < anchorLeft - 900000) continue
+    if (bestDist <= Math.max(spacing * 0.55, Math.min(spacing, 300000))) best.members.push(child)
   }
   for (const row of rows) row.members.sort((a, b) => a.start - b.start)
   return rows
 }
 
-/** Clone entry rows so there are `count` of them, spread over the original area. */
+function nodeX(node) {
+  const off = /<a:off x="(-?\d+)" y="(-?\d+)"\/>/.exec(node.xml)
+  return off ? Number(off[1]) : 0
+}
+
+function nodeCx(node) {
+  const ext = /<a:ext cx="(\d+)" cy="(\d+)"/.exec(node.xml)
+  return ext ? Number(ext[1]) : 0
+}
+
+function rowBounds(members) {
+  const top = Math.min(...members.map((member) => nodeY(member)))
+  const bottom = Math.max(...members.map((member) => nodeY(member) + nodeCy(member)))
+  const left = Math.min(...members.map((member) => nodeX(member)))
+  const right = Math.max(...members.map((member) => nodeX(member) + nodeCx(member)))
+  return { top, bottom, left, right, h: Math.max(bottom - top, 1), w: Math.max(right - left, 1) }
+}
+
+/**
+ * A group whose child coordinates are not slide units. Rewriting those
+ * offsets with slide-sized steps is what knocks the number off its pill.
+ */
+function childSpaceGroup(node) {
+  if (node.tag !== "grpSp") return false
+  const prEnd = node.xml.indexOf("</p:grpSpPr>")
+  if (prEnd < 0) return false
+  const pr = node.xml.slice(0, prEnd)
+  const ext = pr.match(/<a:ext cx="(\d+)" cy="(\d+)"\/>/)
+  const child = pr.match(/<a:chExt cx="(\d+)" cy="(\d+)"\/>/)
+  if (!ext || !child) return false
+  const sx = Number(ext[1]) / Math.max(Number(child[1]), 1)
+  const sy = Number(ext[2]) / Math.max(Number(child[2]), 1)
+  return sx > 1.4 || sx < 0.7 || sy > 1.4 || sy < 0.7
+}
+
+function groupSlideBox(node) {
+  const prEnd = node.xml.indexOf("</p:grpSpPr>")
+  if (prEnd < 0) return null
+  const pr = node.xml.slice(0, prEnd)
+  const off = pr.match(/<a:off x="(-?\d+)" y="(-?\d+)"\/>/)
+  const ext = pr.match(/<a:ext cx="(\d+)" cy="(\d+)"\/>/)
+  if (!off || !ext) return null
+  return { x: Number(off[1]), y: Number(off[2]), cx: Number(ext[1]), cy: Number(ext[2]) }
+}
+
+/** Drop the template's entry group and draw one rigid row per section. */
+function paintGroupedToc(xml, groupNode, labels) {
+  const box = groupSlideBox(groupNode)
+  if (!box || box.cx < 1_500_000 || box.cy < 800_000 || labels.length === 0) return null
+  const ids = { n: nextShapeId(xml) }
+  const drawn = paintTocRows(labels, box, ids)
+  const without = xml.slice(0, groupNode.start) + xml.slice(groupNode.end)
+  if (!without.includes("</p:spTree>")) return null
+  return without.replace("</p:spTree>", `${drawn}</p:spTree>`)
+}
+
+function paintTocRows(labels, box, ids) {
+  const columns = labels.length > 7 ? 2 : 1
+  const per = Math.ceil(labels.length / columns)
+  const gutter = columns === 2 ? 200_000 : 0
+  const colW = Math.floor((box.cx - gutter) / columns)
+  const slot = Math.floor(box.cy / per)
+  const gap = Math.min(140_000, Math.floor(slot * 0.18))
+  const pillH = Math.min(Math.max(slot - gap, 200_000), 660_000)
+  const parts = []
+  labels.forEach((label, index) => {
+    const col = Math.floor(index / per)
+    const row = index % per
+    const x = box.x + col * (colW + gutter)
+    const y = box.y + row * slot + Math.floor((slot - pillH) / 2)
+    const d = Math.round(Math.min(pillH * 0.58, 480_000))
+    const badgeX = x + Math.round(pillH * 0.28)
+    const badgeY = y + Math.round((pillH - d) / 2)
+    const textX = badgeX + d + 120_000
+    const textW = Math.max(x + colW - 80_000 - textX, 400_000)
+    parts.push(tocPill(ids, x, y, colW - 60_000, pillH))
+    parts.push(tocBadge(ids, badgeX, badgeY, d))
+    parts.push(tocNumber(ids, badgeX, badgeY, d, index + 1))
+    parts.push(plainText(ids, label, textX, y, textW, pillH, "1A56C8", label.length > 12 ? 1700 : 1900, "l"))
+  })
+  return parts.join("")
+}
+
+function tocPill(ids, x, y, cx, cy) {
+  return `<p:sp><p:nvSpPr><p:cNvPr id="${ids.n++}" name="目录条"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${Math.round(x)}" y="${Math.round(y)}"/><a:ext cx="${Math.max(Math.round(cx), 100000)}" cy="${Math.max(Math.round(cy), 100000)}"/></a:xfrm><a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val 50000"/></a:avLst></a:prstGeom><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:ln w="6350"><a:solidFill><a:srgbClr val="E3EAF2"/></a:solidFill></a:ln><a:effectLst><a:outerShdw blurRad="63500" dist="25400" dir="2700000" algn="tl" rotWithShape="0"><a:srgbClr val="8AA0B8"><a:alpha val="28000"/></a:srgbClr></a:outerShdw></a:effectLst></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang="zh-CN"/></a:p></p:txBody></p:sp>`
+}
+
+function tocBadge(ids, x, y, d) {
+  return `<p:sp><p:nvSpPr><p:cNvPr id="${ids.n++}" name="序号"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${Math.round(x)}" y="${Math.round(y)}"/><a:ext cx="${Math.round(d)}" cy="${Math.round(d)}"/></a:xfrm><a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="2F6BFF"/></a:solidFill><a:ln><a:noFill/></a:ln></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang="zh-CN"/></a:p></p:txBody></p:sp>`
+}
+
+function tocNumber(ids, x, y, d, value) {
+  const size = d >= 400_000 ? 1600 : 1400
+  const label = String(value).padStart(2, "0")
+  return `<p:sp><p:nvSpPr><p:cNvPr id="${ids.n++}" name="序号字"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${Math.round(x)}" y="${Math.round(y)}"/><a:ext cx="${Math.round(d)}" cy="${Math.round(d)}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></p:spPr><p:txBody><a:bodyPr wrap="none" anchor="ctr" lIns="0" tIns="0" rIns="0" bIns="0"/><a:lstStyle/><a:p><a:pPr algn="ctr"><a:buNone/></a:pPr><a:r><a:rPr lang="zh-CN" sz="${size}" b="1" dirty="0"><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:latin typeface="微软雅黑"/><a:ea typeface="微软雅黑"/></a:rPr><a:t>${label}</a:t></a:r></a:p></p:txBody></p:sp>`
+}
+
+/**
+ * Move each contents row as one piece: pill, badge and label keep their
+ * relative places. The pitch stays at least the row height, so rows cannot
+ * stack. A second column is used only when the row is narrow enough to fit.
+ */
 function renderTocRows(rows, count, textFor) {
-  const top = Math.min(...rows.flatMap((row) => row.members.map((member) => nodeY(member))))
-  const bottom = Math.max(...rows.flatMap((row) => row.members.map((member) => nodeY(member) + nodeCy(member))))
-  if (bottom <= top) return ""
-  const slotH = (bottom - top) / count
-  const protoH = (bottom - top) / rows.length
-  const ratio = slotH / protoH
+  const bounds = rows.map((row) => rowBounds(row.members))
+  const rowH = Math.max(...bounds.map((item) => item.h))
+  const rowW = Math.max(...bounds.map((item) => item.w))
+  const top = Math.min(...bounds.map((item) => item.top))
+  const bottom = Math.max(...bounds.map((item) => item.bottom))
+  const left = Math.min(...bounds.map((item) => item.left))
+  if (!(bottom > top)) return ""
+  const ordered = [...bounds].sort((a, b) => a.top - b.top)
+  let gap = Math.round(rowH * 0.16)
+  if (ordered.length > 1) {
+    const pitches = []
+    for (let i = 1; i < ordered.length; i += 1) pitches.push(ordered[i].top - ordered[i - 1].top)
+    pitches.sort((a, b) => a - b)
+    const pitch0 = pitches[Math.floor(pitches.length / 2)]
+    if (pitch0 > rowH) gap = Math.round(pitch0 - rowH)
+  }
+  const rhythm = rowH + gap
+  const available = Math.max(bottom - top, rhythm)
+  const slideRight = 12_192_000 - 140_000
+  const gutter = Math.max(gap, 160_000)
+  let columns = 1
+  let widthScale = 1
+  if (count > rows.length && count * rhythm > available) {
+    const colW = Math.floor((slideRight - left - gutter) / 2)
+    if (colW >= 2_200_000) {
+      columns = 2
+      widthScale = Math.min(1, colW / rowW)
+    }
+  }
+  const per = Math.ceil(count / columns)
+  const raw = (available - 20_000) / Math.max(per * rhythm, 1)
+  const scale = Math.min(1, raw > 0 ? raw : 1)
+  let visualH = Math.max(Math.floor(rowH * scale), 1)
+  let visualGap = Math.max(Math.floor(gap * scale), 0)
+  if (per > 1 && per * (visualH + visualGap) > available) {
+    const room = Math.floor(available / per)
+    visualGap = Math.min(visualGap, Math.floor(room * 0.16))
+    visualH = Math.max(room - visualGap, 1)
+  }
+  const pitch = visualH + visualGap
+  const fit = visualH / rowH
+  const columnSpan = Math.floor(rowW * widthScale) + gutter
   const parts = []
   for (let index = 0; index < count; index += 1) {
     const proto = rows[index % rows.length]
-    const protoTop = Math.min(...proto.members.map((member) => nodeY(member)))
+    const bound = rowBounds(proto.members)
+    const column = Math.floor(index / per)
+    const rowIndex = index % per
+    const originY = top + rowIndex * pitch
     for (const member of proto.members) {
-      const newY = Math.round(top + index * slotH + (nodeY(member) - protoTop) * ratio)
-      let out = member.xml.replace(/<a:off x="(-?\d+)" y="(-?\d+)"\/>/, (_full, x) => `<a:off x="${x}" y="${newY}"/>`)
+      if (isTocOrnament(member)) continue
+      const square = nodeCx(member) > 0 && nodeCx(member) < nodeCy(member) * 1.8 && nodeCy(member) < nodeCx(member) * 1.8
+      const y = Math.round(originY + (nodeY(member) - bound.top) * fit)
+      const x = Math.round(bound.left + (nodeX(member) - bound.left) * widthScale + column * columnSpan)
+      const cy = Math.max(Math.round(nodeCy(member) * fit), 1)
+      const cx = Math.max(Math.round(nodeCx(member) * (square ? fit : widthScale)), 1)
+      let out = member.xml
+        .replace(/<a:off x="(-?\d+)" y="(-?\d+)"\/>/, `<a:off x="${x}" y="${y}"/>`)
+        .replace(/<a:ext cx="(\d+)" cy="(\d+)"\/>/, `<a:ext cx="${cx}" cy="${cy}"/>`)
       const action = textFor(member, index)
-      if (action.label !== undefined) out = setFirstText(out, action.label.slice(0, 24))
+      if (action.label !== undefined) out = setFirstText(out, action.label)
       else if (action.number !== undefined) out = setNumberText(out, action.number)
       parts.push(out)
     }
@@ -679,11 +1126,16 @@ function replaceTocRows(xml, container, rows, rendered) {
 
 function setFirstText(spXml, text) {
   let used = false
-  return spXml.replace(/<a:t([^>]*)>([^<]*)<\/a:t>/g, (full, attrs) => {
+  const size = text.length > 18 ? "1700" : text.length > 12 ? "1900" : ""
+  let out = spXml.replace(/<a:t([^>]*)>([^<]*)<\/a:t>/g, (full, attrs) => {
     if (used) return `<a:t${attrs}></a:t>`
     used = true
     return `<a:t${attrs}>${escapeXml(text)}</a:t>`
   })
+  if (!/wrap="/.test(out)) out = out.replace(/<a:bodyPr\b([^>]*?)(\/?)>/, `<a:bodyPr wrap="square"$1$2>`)
+  if (size) out = out.replace(/sz="\d+"/, `sz="${size}"`)
+  out = out.replace(/<a:spAutoFit\/>/g, "<a:normAutofit/>")
+  return out
 }
 
 function setNumberText(nodeXml, value) {
@@ -711,28 +1163,166 @@ function fillNumberedToc(xml, labels) {
     const label = labels[slot] ?? ""
     slot += 1
     if (!label) return `<a:t${attrs}></a:t>`
-    return `<a:t${attrs}>${escapeXml(label.slice(0, 16))}</a:t>`
+    return `<a:t${attrs}>${escapeXml(label)}</a:t>`
   })
 }
 
 function fillEnding(xml) {
-  return xml.replace(/<a:t([^>]*)>([^<]*)<\/a:t>/g, (full, attrs, text) => {
-    if (!PLACEHOLDER_TEXT.test(decodeXml(text).trim())) return full
-    return `<a:t${attrs}>谢谢</a:t>`
+  return xml.replace(/<p:sp\b[\s\S]*?<\/p:sp>/g, (shape) => {
+    const text = slideText(shape).replace(/\s+/g, "")
+    if (!text) return shape
+    if (PLACEHOLDER_TEXT.test(text) || /^(谢谢聆听|谢谢|感谢|感谢聆听)$/.test(text)) return replaceFirstRun(shape, "谢谢")
+    if (/公司|有限|集团|股份|20\d{2}年/.test(text)) return clearShapeText(shape)
+    return shape
   })
 }
 
-function fillContent(xml, page, box, size) {
-  const opened = openGroup(xml, size)
-  const ids = { n: 2 }
-  const title = titleShape(page.title, ids)
+function fillContent(xml, page, box, size, layoutXml = "") {
+  let opened = openGroup(xml, size)
+  if (page.chart || page.table) opened = prepareVisualSlide(opened)
+  const mediaBox = mergeContentBox(box, layoutXml, size)
+  const shapes = collectTextShapes(opened)
+  const titleShape = pickTitleShape(shapes, page.title)
+  const bodyShape = pickBodyShape(shapes, titleShape)
+  const ids = { n: nextShapeId(opened) }
+  let title = ""
+  let titleFrame = titleShape?.box ?? null
+  if (titleShape) {
+    title = setShapeParagraphs(titleShape.raw, [{ role: "title", text: clean(page.title) || "正文" }], 1)
+    opened = replaceShapeInXml(opened, titleShape.raw, "")
+  } else {
+    titleFrame = fallbackTitleBox(mediaBox)
+    title = titleShapeXml(page.title, ids, mediaBox)
+  }
+  const region = clearOfTitle(usableBox(bodyShape, mediaBox, size), titleFrame ? { box: titleFrame } : null)
+  if (bodyShape && opened.includes(bodyShape.raw)) opened = replaceShapeInXml(opened, bodyShape.raw, "")
+  const caption = (page.pieces ?? []).map((piece) => stripCue(piece.text)).filter(Boolean)
   const body = page.chart
-    ? chartShapes(page.chart, box, ids)
+    ? chartShapes(page.chart, region, ids)
     : page.table
-      ? tableShape(page.table, box, ids, page.rowHeights)
-      : textShape(page.pieces, box, ids, page.scale ?? 1)
-  if (opened.includes("</p:spTree>")) return opened.replace("</p:spTree>", `${title}${body}</p:spTree>`)
+      ? captionAndTable(caption, page, region, ids)
+      : cardLayout(caption, region, ids)
+  // Title is written after the body so a bar that still reaches up cannot cover the heading.
+  if (opened.includes("</p:spTree>")) return opened.replace("</p:spTree>", `${body}${title}</p:spTree>`)
   return opened
+}
+
+/** Keep the body, table and chart below the title instead of painting across it. */
+function clearOfTitle(region, titleShape) {
+  if (!titleShape?.box) return region
+  const floor = titleShape.box.y + titleShape.box.cy + 80_000
+  if (region.y >= floor) return region
+  const bottom = region.y + region.cy
+  const cy = bottom - floor
+  if (cy < 1_400_000) return region
+  return { ...region, y: floor, cy }
+}
+
+function usableBox(bodyShape, fallback, size) {
+  if (bodyShape && bodyShape.box.cy >= 1600000 && bodyShape.box.cx >= 2000000) return bodyShape.box
+  if (fallback && fallback.cy >= 1600000 && fallback.cx >= size.cx * 0.8) return fallback
+  const y = Math.round(size.cy * 0.22)
+  return {
+    x: Math.round(size.cx * 0.05),
+    y,
+    cx: Math.round(size.cx * 0.9),
+    cy: Math.max(size.cy - y - Math.round(size.cy * 0.08), 1_600_000),
+  }
+}
+
+function fallbackTitleBox(box) {
+  const y = Math.max(box.y - 780000, 280000)
+  return { x: box.x, y, cx: Math.min(box.cx, 9000000), cy: 560000 }
+}
+
+function titleShapeXml(title, ids, box) {
+  const frame = fallbackTitleBox(box)
+  return plainText(ids, clean(title) || "正文", frame.x, frame.y, frame.cx, frame.cy, "1F4E79", 3200, "l")
+}
+
+function captionAndTable(caption, page, box, ids) {
+  const note = caption[0] ? plainText(ids, caption.join(" "), box.x, box.y, box.cx, 680000, "1F4E79", 1700, "l", "t") : ""
+  const tableBox = caption[0] ? { ...box, y: box.y + 780000, cy: Math.max(box.cy - 780000, 800000) } : box
+  return note + tableShape(page.table, tableBox, ids, page.rowHeights)
+}
+
+/** A conclusion bar, up to three KPI chips, then the remaining points as cards. */
+function cardLayout(lines, box, ids) {
+  const points = lines.filter(Boolean)
+  if (points.length === 0) return textShape([{ role: "body", text: "未提供" }], box, ids)
+  const kpis = extractKpis(points).slice(0, 3)
+  let y = box.y
+  let left = box.cy
+  const parts = []
+  if (kpis.length >= 2) {
+    const h = Math.min(980000, Math.round(left * 0.28))
+    parts.push(kpiRow(kpis, { x: box.x, y, cx: box.cx, cy: h }, ids))
+    y += h + 80000
+    left -= h + 80000
+  }
+  const lead = points[0]
+  const rest = points.slice(1, 4)
+  const gap = 120000
+  const cardsNeed = rest.length > 0 ? Math.min(2_400_000, Math.round(left * 0.58)) : 0
+  const maxLead = rest.length > 0 ? Math.max(left - cardsNeed - gap, 780000) : left
+  const fitted = fitBlock(lead, box.cx - 320000, maxLead, 2000)
+  const leadH = rest.length > 0 ? fitted.height : left
+  parts.push(leadBar(lead, { x: box.x, y, cx: box.cx, cy: leadH }, ids, fitted.size))
+  if (rest.length > 0) {
+    y += leadH + gap
+    left = Math.max(box.y + box.cy - y, 600000)
+    parts.push(cardRow(rest, { x: box.x, y, cx: box.cx, cy: left }, ids))
+  }
+  return parts.join("")
+}
+
+function extractKpis(lines) {
+  const found = []
+  const pattern = /\$?\s*(\d+(?:\.\d+)?)\s*(HKD\/月|港元\/月|万|亿|%|％|宗)/g
+  for (const line of lines) {
+    const compact = line.replace(/\s+/g, "")
+    for (const match of compact.matchAll(pattern)) {
+      const value = `${match[1]}${match[2]}`
+      if (match[1] === "0" || found.some((item) => item.value === value)) continue
+      found.push({ value, hint: line.slice(0, 14) })
+      if (found.length >= 3) return found
+    }
+  }
+  return found
+}
+
+function kpiRow(kpis, box, ids) {
+  const gap = 120000
+  const width = Math.floor((box.cx - gap * (kpis.length - 1)) / kpis.length)
+  return kpis.map((kpi, index) => {
+    const x = box.x + index * (width + gap)
+    return rounded(ids, x, box.y, width, box.cy, "E8F3FC")
+      + plainText(ids, kpi.value, x + 120000, box.y + 80000, width - 240000, Math.round(box.cy * 0.48), "0070C0", 2800, "l")
+      + plainText(ids, kpi.hint, x + 120000, box.y + Math.round(box.cy * 0.52), width - 240000, Math.round(box.cy * 0.36), "666666", 1400, "l")
+  }).join("")
+}
+
+function leadBar(text, box, ids, size = 2000) {
+  return rounded(ids, box.x, box.y, box.cx, box.cy, "F4F8FB")
+    + plainText(ids, text, box.x + 160000, box.y + 60000, box.cx - 320000, box.cy - 120000, "1F4E79", size, "l", "t")
+}
+
+function cardRow(lines, box, ids) {
+  const gap = 140000
+  const width = Math.floor((box.cx - gap * (lines.length - 1)) / lines.length)
+  const textTop = 480000
+  const textH = Math.max(box.cy - textTop - 80000, 400000)
+  const size = Math.min(...lines.map((line) => fitBlock(line, width - 280000, textH, 1800).size))
+  return lines.map((line, index) => {
+    const x = box.x + index * (width + gap)
+    return rounded(ids, x, box.y, width, box.cy, index === 0 ? "E8F3FC" : "F7F9FB")
+      + plainText(ids, String(index + 1).padStart(2, "0"), x + 140000, box.y + 80000, width - 280000, 340000, "0070C0", 2000, "l")
+      + plainText(ids, line, x + 140000, box.y + textTop, width - 280000, textH, "333333", size, "l", "t")
+  }).join("")
+}
+
+function rounded(ids, x, y, cx, cy, color) {
+  return `<p:sp><p:nvSpPr><p:cNvPr id="${ids.n++}" name="卡片"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${Math.round(x)}" y="${Math.round(y)}"/><a:ext cx="${Math.max(Math.round(cx), 100000)}" cy="${Math.max(Math.round(cy), 100000)}"/></a:xfrm><a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val 8000"/></a:avLst></a:prstGeom><a:solidFill><a:srgbClr val="${color}"/></a:solidFill><a:ln><a:noFill/></a:ln></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang="zh-CN"/></a:p></p:txBody></p:sp>`
 }
 
 function openGroup(xml, size) {
@@ -860,6 +1450,8 @@ function slideProblems(xml) {
     if (sizes.length < 4 || sizes.some((value) => value !== "0")) problems.push("幻灯片根组合被写成了非 0 尺寸")
   }
   if (/&(?!amp;|lt;|gt;|quot;|apos;|#)/.test(xml)) problems.push("存在未转义的 &")
+  const unclosed = unclosedTag(xml)
+  if (unclosed) problems.push(unclosed)
   const ids = [...xml.matchAll(/<p:cNvPr id="(\d+)"/g)].map((match) => match[1])
   if (new Set(ids).size !== ids.length) problems.push("形状编号重复")
   for (const frame of xml.matchAll(/<p:graphicFrame>[\s\S]*?<\/p:graphicFrame>/g)) {
@@ -986,7 +1578,160 @@ function slideSize(presentation) {
   return { cx: Number(match?.[1] ?? 12192000), cy: Number(match?.[2] ?? 6858000) }
 }
 
+function shapeExtent(spXml) {
+  const m = spXml.match(/<a:xfrm>[\s\S]*?<a:off x="(-?\d+)" y="(-?\d+)"\/><a:ext cx="(\d+)" cy="(\d+)"/)
+  if (!m) return null
+  return { x: Number(m[1]), y: Number(m[2]), cx: Number(m[3]), cy: Number(m[4]) }
+}
+
+function collectTextShapes(xml) {
+  const list = []
+  for (const match of xml.matchAll(/<p:sp\b[\s\S]*?<\/p:sp>/g)) {
+    const raw = match[0]
+    if (!/<(?:a|p):txBody\b/.test(raw)) continue
+    if (/<p:ph\b[^>]*type="(?:dt|ftr|sldNum)"/.test(raw)) continue
+    const box = shapeExtent(raw)
+    if (!box || box.cx < 400000 || box.cy < 120000) continue
+    list.push({
+      raw,
+      box,
+      area: box.cx * box.cy,
+      isTitle: /<p:ph\b[^>]*type="title"/.test(raw),
+      isBody: /<p:ph\b[^>]*type="body"/.test(raw) || /<p:ph idx="1"/.test(raw),
+    })
+  }
+  return list
+}
+
+function pickTitleShape(shapes, pageTitle) {
+  const titled = shapes.filter((s) => s.isTitle)
+  if (titled.length > 0) return titled.sort((a, b) => a.box.y - b.box.y)[0]
+  const top = [...shapes].sort((a, b) => a.box.y - b.box.y || b.area - a.area)
+  if (top.length === 0) return undefined
+  const first = top[0]
+  if (first.box.y < 900000 && first.area < top.reduce((m, s) => Math.max(m, s.area), 0) * 0.35) return first
+  if (clean(pageTitle).length <= 40 && first.box.y < 1200000) return first
+  return undefined
+}
+
+function pickBodyShape(shapes, titleShape) {
+  const bodied = shapes.filter((s) => s.isBody && s !== titleShape)
+  if (bodied.length > 0) return bodied.sort((a, b) => b.area - a.area)[0]
+  const minY = titleShape ? titleShape.box.y + titleShape.box.cy * 0.5 : 800000
+  const candidates = shapes.filter((s) => s !== titleShape && s.box.y >= minY - 200000)
+  if (candidates.length === 0) return shapes.filter((s) => s !== titleShape).sort((a, b) => b.area - a.area)[0]
+  return candidates.sort((a, b) => b.area - a.area)[0]
+}
+
+function setShapeParagraphs(shape, pieces, scale = 1) {
+  const body = (pieces.length > 0 ? pieces : [{ role: "body", text: "未提供" }])
+    .map((piece) => paragraph(piece.text, piece.role, scale))
+    .join("")
+  return shape.replace(/<(a|p):txBody\b[^>]*>[\s\S]*?<\/\1:txBody>/, (txBody, ns) => {
+    const { bodyPr, lst } = txBodyChrome(txBody)
+    return `<${ns}:txBody>${bodyPr}${lst}${body}</${ns}:txBody>`
+  })
+}
+
+function unclosedTag(xml) {
+  const stack = []
+  const re = /<\/?([A-Za-z0-9:_-]+)([^>]*)>/g
+  let match
+  while ((match = re.exec(xml))) {
+    const raw = match[0]
+    if (raw.startsWith("<!") || raw.startsWith("<?") || /\/\s*>$/.test(raw)) continue
+    const name = match[1]
+    if (raw.startsWith("</")) {
+      const open = stack.pop()
+      if (open !== name) return `${open ?? "文档开头"} 与 </${name}> 未配对`
+    } else stack.push(name)
+  }
+  return stack.length > 0 ? `${stack[stack.length - 1]} 未闭合` : ""
+}
+
+function replaceShapeInXml(xml, oldShape, newShape) {
+  const index = xml.indexOf(oldShape)
+  if (index < 0) return xml
+  return xml.slice(0, index) + newShape + xml.slice(index + oldShape.length)
+}
+
+/** Fill template text boxes in place (preserves fonts/fills). Returns null when injection is safer. */
+function fillContentInPlace(xml, page) {
+  const shapes = collectTextShapes(xml)
+  if (shapes.length === 0) return null
+  const titleShape = pickTitleShape(shapes, page.title)
+  const bodyShape = pickBodyShape(shapes, titleShape)
+  if (!titleShape && !bodyShape) return null
+  if (titleShape && !bodyShape && (page.pieces?.length ?? 0) > 0) return null
+  let next = xml
+  if (titleShape) {
+    const titleOnly = [{ role: "subtitle", text: clean(page.title) || "正文" }]
+    next = replaceShapeInXml(next, titleShape.raw, setShapeParagraphs(titleShape.raw, titleOnly, 1))
+  }
+  if (bodyShape) {
+    const pieces = page.pieces?.length ? page.pieces : [{ role: "body", text: "未提供" }]
+    const updated = setShapeParagraphs(bodyShape.raw, pieces, page.scale ?? 1)
+    next = replaceShapeInXml(next, bodyShape.raw, updated)
+  }
+  if (!titleShape && bodyShape) {
+    const withTitle = [{ role: "subtitle", text: clean(page.title) || "正文" }, ...(page.pieces ?? [])]
+    next = replaceShapeInXml(next, bodyShape.raw, setShapeParagraphs(bodyShape.raw, withTitle, page.scale ?? 1))
+  }
+  return next
+}
+
+function placeholderExtent(layoutXml, kind) {
+  if (!layoutXml) return null
+  const pattern =
+    kind === "title"
+      ? /<p:sp>[\s\S]*?<p:ph type="title"[\s\S]*?<\/p:sp>/i
+      : /<p:sp>[\s\S]*?<p:ph(?:\s[^>]*)?(?:type="body"|idx="1")[\s\S]*?<\/p:sp>/i
+  const block = pattern.exec(layoutXml)?.[0]
+  if (!block) return null
+  return shapeExtent(block)
+}
+
+/** 图表/表格页：去掉空白正文占位，避免挡住矢量图。保留标题占位与背景图。 */
+function prepareVisualSlide(xml) {
+  return xml.replace(/<p:sp\b[\s\S]*?<\/p:sp>/g, (shape) => {
+    if (/<p:ph\b[^>]*type="title"/.test(shape)) return shape
+    if (/<p:ph\b[^>]*type="(?:body|subTitle|ctrTitle)"/.test(shape)) return ""
+    if (/<a:txBody\b/.test(shape) && !slideText(shape).trim()) return ""
+    return shape
+  })
+}
+
+function nextShapeId(xml) {
+  let max = 1
+  for (const match of xml.matchAll(/<p:cNvPr id="(\d+)"/g)) max = Math.max(max, Number(match[1]))
+  return max + 1
+}
+
+function mergeContentBox(box, layoutXml, slide) {
+  const body = placeholderExtent(layoutXml, "body")
+  if (!body) return box
+  const title = placeholderExtent(layoutXml, "title")
+  let merged = { ...body }
+  if (title && title.x > 0 && Math.abs(title.x - merged.x) < 4000000) {
+    merged.x = title.x
+    merged.cx = Math.max(box.x + box.cx - merged.x, body.cx)
+  }
+  merged.cy = Math.max(merged.cy, Math.min(body.cy, box.cy))
+  return merged
+}
+
 function contentBox(layoutXml, slide) {
+  const fromPh = placeholderExtent(layoutXml, "body")
+  if (fromPh && fromPh.cx >= 2000000 && fromPh.cy >= 1800000) {
+    const title = placeholderExtent(layoutXml, "title")
+    const box = { ...fromPh }
+    if (title && title.x > 0) {
+      const right = box.x + box.cx
+      box.x = title.x
+      box.cx = Math.max(right - box.x, 2000000)
+    }
+    return box
+  }
   let best
   for (const pic of layoutXml.matchAll(/<p:pic>[\s\S]*?<\/p:pic>/g)) {
     const off = pic[0].match(/<a:off x="(-?\d+)" y="(-?\d+)"\/><a:ext cx="(\d+)" cy="(\d+)"/)
@@ -1114,9 +1859,9 @@ function barShapes(series, box, ids) {
     const y = box.y + index * rowH
     const barW = Math.max(Math.round((item.value / max) * plotW), 80000)
     const color = CHART_COLORS[index % CHART_COLORS.length]
-    parts.push(plainText(ids, item.label, box.x, y, labelW, rowH, "333333", 1400, "r"))
+    parts.push(plainText(ids, item.label, box.x, y, labelW, rowH, "333333", 1600, "r"))
     parts.push(rect(ids, plotX, y + Math.round((rowH - barH) / 2), barW, barH, color))
-    parts.push(plainText(ids, item.display || formatNumber(item.value), plotX + barW + 60000, y, 680000, rowH, "333333", 1200, "l"))
+    parts.push(plainText(ids, item.display || formatNumber(item.value), plotX + barW + 60000, y, 680000, rowH, "333333", 1400, "l"))
   })
   return parts.join("")
 }
@@ -1134,8 +1879,8 @@ function columnShapes(series, box, ids) {
     const color = CHART_COLORS[index % CHART_COLORS.length]
     const barW = Math.round(colW * 0.62)
     parts.push(rect(ids, x + Math.round((colW - barW) / 2), baseY - height, barW, height, color))
-    parts.push(plainText(ids, item.display || formatNumber(item.value), x, baseY - height - 280000, colW, 260000, "333333", 1200, "ctr"))
-    parts.push(plainText(ids, item.label, x, baseY + 60000, colW, Math.max(box.y + box.cy - baseY - 80000, 280000), "333333", 1200, "ctr"))
+    parts.push(plainText(ids, item.display || formatNumber(item.value), x, baseY - height - 280000, colW, 260000, "333333", 1400, "ctr"))
+    parts.push(plainText(ids, item.label, x, baseY + 60000, colW, Math.max(box.y + box.cy - baseY - 80000, 280000), "333333", 1500, "ctr"))
   })
   return parts.join("")
 }
@@ -1162,7 +1907,7 @@ function pieShapes(series, box, ids) {
     const swatch = Math.min(180000, Math.round(rowH * 0.35))
     parts.push(rect(ids, legendX, y + Math.round((rowH - swatch) / 2), swatch, swatch, color))
     const share = Math.round((item.value / total) * 1000) / 10
-    parts.push(plainText(ids, `${item.label}  ${item.display || formatNumber(item.value)}（${share}%）`, legendX + swatch + 100000, y, legendW - swatch - 100000, rowH, "333333", 1400, "l"))
+    parts.push(plainText(ids, `${item.label}  ${item.display || formatNumber(item.value)}（${share}%）`, legendX + swatch + 100000, y, legendW - swatch - 100000, rowH, "333333", 1600, "l"))
   })
   return parts.join("")
 }
@@ -1175,16 +1920,17 @@ function fixedAngle(degrees) {
 
 function pieSlice(ids, x, y, size, startDeg, sweepDeg, color) {
   const rot = fixedAngle(startDeg)
-  const adj = Math.min(Math.max(Math.round(sweepDeg * 60_000), 1), 21_599_999)
-  return `<p:sp><p:nvSpPr><p:cNvPr id="${ids.n++}" name="扇形"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm rot="${rot}"><a:off x="${x}" y="${y}"/><a:ext cx="${size}" cy="${size}"/></a:xfrm><a:prstGeom prst="pie"><a:avLst><a:gd name="adj1" fmla="val ${adj}"/><a:gd name="adj2" fmla="val 0"/></a:avLst></a:prstGeom><a:solidFill><a:srgbClr val="${color}"/></a:solidFill><a:ln><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill></a:ln></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang="zh-CN"/></a:p></p:txBody></p:sp>`
+  // PowerPoint 饼图：adj1/adj2 为起止角（1/60000 度），adj2=0 会导致扇区不可见。
+  const endAdj = Math.min(Math.max(Math.round(sweepDeg * 60_000), 1), 21_599_999)
+  return `<p:sp><p:nvSpPr><p:cNvPr id="${ids.n++}" name="扇形"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm rot="${rot}"><a:off x="${x}" y="${y}"/><a:ext cx="${size}" cy="${size}"/></a:xfrm><a:prstGeom prst="pie"><a:avLst><a:gd name="adj1" fmla="val 0"/><a:gd name="adj2" fmla="val ${endAdj}"/></a:avLst></a:prstGeom><a:solidFill><a:srgbClr val="${color}"/></a:solidFill><a:ln><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill></a:ln></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang="zh-CN"/></a:p></p:txBody></p:sp>`
 }
 
 function rect(ids, x, y, cx, cy, color) {
   return `<p:sp><p:nvSpPr><p:cNvPr id="${ids.n++}" name="矩形"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${Math.round(x)}" y="${Math.round(y)}"/><a:ext cx="${Math.round(cx)}" cy="${Math.round(cy)}"/></a:xfrm><a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val 8000"/></a:avLst></a:prstGeom><a:solidFill><a:srgbClr val="${color}"/></a:solidFill><a:ln><a:noFill/></a:ln></p:spPr><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang="zh-CN"/></a:p></p:txBody></p:sp>`
 }
 
-function plainText(ids, text, x, y, cx, cy, color, size, align) {
-  return `<p:sp><p:nvSpPr><p:cNvPr id="${ids.n++}" name="标注"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${Math.round(x)}" y="${Math.round(y)}"/><a:ext cx="${Math.max(Math.round(cx), 100000)}" cy="${Math.max(Math.round(cy), 100000)}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></p:spPr><p:txBody><a:bodyPr wrap="square" anchor="ctr" lIns="40000" rIns="40000"/><a:lstStyle/><a:p><a:pPr algn="${align}"><a:buNone/></a:pPr><a:r><a:rPr lang="zh-CN" sz="${size}" dirty="0"><a:solidFill><a:srgbClr val="${color}"/></a:solidFill><a:latin typeface="微软雅黑"/><a:ea typeface="微软雅黑"/></a:rPr><a:t>${escapeXml(text) || " "}</a:t></a:r></a:p></p:txBody></p:sp>`
+function plainText(ids, text, x, y, cx, cy, color, size, align, valign = "ctr") {
+  return `<p:sp><p:nvSpPr><p:cNvPr id="${ids.n++}" name="标注"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="${Math.round(x)}" y="${Math.round(y)}"/><a:ext cx="${Math.max(Math.round(cx), 100000)}" cy="${Math.max(Math.round(cy), 100000)}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></p:spPr><p:txBody><a:bodyPr wrap="square" horzOverflow="clip" vertOverflow="clip" anchor="${valign}" lIns="60000" tIns="20000" rIns="60000" bIns="20000"><a:normAutofit/></a:bodyPr><a:lstStyle/><a:p><a:pPr algn="${align}"><a:buNone/></a:pPr><a:r><a:rPr lang="zh-CN" sz="${size}" dirty="0"><a:solidFill><a:srgbClr val="${color}"/></a:solidFill><a:latin typeface="微软雅黑"/><a:ea typeface="微软雅黑"/></a:rPr><a:t>${escapeXml(text) || " "}</a:t></a:r></a:p></p:txBody></p:sp>`
 }
 
 /** A cell is a measure only when the whole cell is one number plus an optional unit. */
@@ -1201,11 +1947,15 @@ function measureOf(value) {
 }
 
 function numberOf(value) {
-  const text = String(value ?? "").replace(/,/g, "")
-  const match = /-?\d+(?:\.\d+)?/.exec(text.replace(/%/g, ""))
+  const measured = measureOf(value)
+  if (measured !== null) return measured
+  const text = String(value ?? "").replace(/,/g, "").replace(/\s+/g, "")
+  const match = /(-?\d+(?:\.\d+)?)(%|％|万|亿)?/.exec(text)
   if (!match) return null
-  const amount = Number(match[0])
+  let amount = Number(match[1])
   if (!Number.isFinite(amount)) return null
+  if (match[2] === "万") amount *= 10_000
+  else if (match[2] === "亿") amount *= 100_000_000
   return amount
 }
 
@@ -1218,7 +1968,7 @@ function cell(text, header) {
   const fill = header ? "0070C0" : "FFFFFF"
   const color = header ? "FFFFFF" : "333333"
   const bold = header ? ' b="1"' : ""
-  return `<a:tc><a:txBody><a:bodyPr anchor="ctr"/><a:lstStyle/><a:p><a:pPr algn="${header ? "ctr" : "l"}"/><a:r><a:rPr lang="zh-CN" sz="1200"${bold} dirty="0"><a:solidFill><a:srgbClr val="${color}"/></a:solidFill><a:latin typeface="微软雅黑"/><a:ea typeface="微软雅黑"/></a:rPr><a:t>${escapeXml(text) || " "}</a:t></a:r></a:p></a:txBody><a:tcPr><a:solidFill><a:srgbClr val="${fill}"/></a:solidFill></a:tcPr></a:tc>`
+  return `<a:tc><a:txBody><a:bodyPr anchor="ctr"/><a:lstStyle/><a:p><a:pPr algn="${header ? "ctr" : "l"}"/><a:r><a:rPr lang="zh-CN" sz="1500"${bold} dirty="0"><a:solidFill><a:srgbClr val="${color}"/></a:solidFill><a:latin typeface="微软雅黑"/><a:ea typeface="微软雅黑"/></a:rPr><a:t>${escapeXml(text) || " "}</a:t></a:r></a:p></a:txBody><a:tcPr><a:solidFill><a:srgbClr val="${fill}"/></a:solidFill></a:tcPr></a:tc>`
 }
 
 function paragraph(text, role, scale = 1) {
@@ -1226,12 +1976,15 @@ function paragraph(text, role, scale = 1) {
   const sz = (base) => String(Math.max(Math.round(base * scale), 1000))
   const before = (base) => String(Math.max(Math.round(base * scale), 100))
   if (role === "bullet") {
-    return `<a:p><a:pPr marL="228600" indent="-228600"><a:lnSpc><a:spcPct val="112000"/></a:lnSpc><a:spcBef><a:spcPts val="${before(220)}"/></a:spcBef><a:buFont typeface="Arial"/><a:buChar char="•"/></a:pPr><a:r><a:rPr lang="zh-CN" sz="${sz(1500)}" dirty="0"><a:solidFill><a:srgbClr val="333333"/></a:solidFill><a:latin typeface="微软雅黑"/><a:ea typeface="微软雅黑"/></a:rPr><a:t>${value}</a:t></a:r></a:p>`
+    return `<a:p><a:pPr marL="228600" indent="-228600"><a:lnSpc><a:spcPct val="112000"/></a:lnSpc><a:spcBef><a:spcPts val="${before(220)}"/></a:spcBef><a:buFont typeface="Arial"/><a:buChar char="•"/></a:pPr><a:r><a:rPr lang="zh-CN" sz="${sz(1800)}" dirty="0"><a:solidFill><a:srgbClr val="333333"/></a:solidFill><a:latin typeface="微软雅黑"/><a:ea typeface="微软雅黑"/></a:rPr><a:t>${value}</a:t></a:r></a:p>`
+  }
+  if (role === "title") {
+    return `<a:p><a:pPr><a:buNone/></a:pPr><a:r><a:rPr lang="zh-CN" sz="${sz(3200)}" b="1" dirty="0"><a:solidFill><a:srgbClr val="1F4E79"/></a:solidFill><a:latin typeface="微软雅黑"/><a:ea typeface="微软雅黑"/></a:rPr><a:t>${value}</a:t></a:r></a:p>`
   }
   if (role === "subtitle") {
-    return `<a:p><a:pPr><a:lnSpc><a:spcPct val="115000"/></a:lnSpc><a:spcBef><a:spcPts val="${before(560)}"/></a:spcBef><a:spcAft><a:spcPts val="${before(200)}"/></a:spcAft><a:buNone/></a:pPr><a:r><a:rPr lang="zh-CN" sz="${sz(1900)}" b="1" dirty="0"><a:solidFill><a:srgbClr val="0070C0"/></a:solidFill><a:latin typeface="微软雅黑"/><a:ea typeface="微软雅黑"/></a:rPr><a:t>${value}</a:t></a:r></a:p>`
+    return `<a:p><a:pPr><a:lnSpc><a:spcPct val="115000"/></a:lnSpc><a:spcBef><a:spcPts val="${before(560)}"/></a:spcBef><a:spcAft><a:spcPts val="${before(200)}"/></a:spcAft><a:buNone/></a:pPr><a:r><a:rPr lang="zh-CN" sz="${sz(2200)}" b="1" dirty="0"><a:solidFill><a:srgbClr val="0070C0"/></a:solidFill><a:latin typeface="微软雅黑"/><a:ea typeface="微软雅黑"/></a:rPr><a:t>${value}</a:t></a:r></a:p>`
   }
-  return `<a:p><a:pPr><a:lnSpc><a:spcPct val="115000"/></a:lnSpc><a:spcBef><a:spcPts val="${before(260)}"/></a:spcBef><a:buNone/></a:pPr><a:r><a:rPr lang="zh-CN" sz="${sz(1500)}" dirty="0"><a:solidFill><a:srgbClr val="333333"/></a:solidFill><a:latin typeface="微软雅黑"/><a:ea typeface="微软雅黑"/></a:rPr><a:t>${value}</a:t></a:r></a:p>`
+  return `<a:p><a:pPr><a:lnSpc><a:spcPct val="115000"/></a:lnSpc><a:spcBef><a:spcPts val="${before(260)}"/></a:spcBef><a:buNone/></a:pPr><a:r><a:rPr lang="zh-CN" sz="${sz(1800)}" dirty="0"><a:solidFill><a:srgbClr val="333333"/></a:solidFill><a:latin typeface="微软雅黑"/><a:ea typeface="微软雅黑"/></a:rPr><a:t>${value}</a:t></a:r></a:p>`
 }
 
 function replaceFirstRun(shape, text) {

@@ -4,10 +4,11 @@ import type { NormalizedMessage } from "@larksuiteoapi/node-sdk"
 import type { ConversationService, ChatIdentity } from "./conversations.js"
 import { mentionsFor, type FeishuBot } from "../feishu/bot.js"
 import { CONFIG_CHANGE_DENIED, isConfigCommand } from "./configGuard.js"
-import { cronManageCard, escapeMarkdown, helpCard, isMailJob, loginCard, mailSubscribeCard, makeFormCard, makePosterCard, markdownCard, skillDeleteConfirmCard, skillFormCard, skillManageCard, skillSavedCard, statusCard, studioCard, studioKindFrom, subscribeCard } from "../feishu/cards.js"
+import { cronManageCard, escapeMarkdown, helpCard, isMailJob, loginCard, mailSubscribeCard, makeFormCard, makePosterCard, markdownCard, parseDeckTask, skillDeleteConfirmCard, skillFormCard, skillManageCard, skillSavedCard, statusCard, studioCard, studioKindFrom, subscribeCard, type DeckTask } from "../feishu/cards.js"
 import { describeSkill } from "../skills/store.js"
 import { ensureDir } from "../util/paths.js"
 import { writeMailScope, type MailBindingStore } from "../mail/binding.js"
+import type { StudioService } from "../studio/service.js"
 
 export interface FormAnswerHandler {
   /** Handle `/answer` text for a session. Returns a human readable status. */
@@ -15,6 +16,29 @@ export interface FormAnswerHandler {
 }
 
 const OPEN_API = "https://open.feishu.cn/open-apis"
+
+/** 三个专项菜单（商业计划书/产品化请示/产品退出评审）的简称 → 成稿任务。 */
+const DECK_ALIASES: Record<string, DeckTask> = {
+  bp: "business-plan",
+  "business-plan": "business-plan",
+  request: "product-request",
+  qs: "product-request",
+  "product-request": "product-request",
+  exit: "product-exit",
+  "product-exit": "product-exit",
+}
+
+function makeDeckTask(raw: string | undefined): DeckTask | undefined {
+  const key = raw?.trim().toLowerCase()
+  if (!key) return undefined
+  return DECK_ALIASES[key] ?? parseDeckTask(key)
+}
+
+export const MAIL_CRON_EXEC_APPENDIX =
+  "【定时邮件订阅 · Bridge 执行说明】\n" +
+  "1. 必须只使用当前会话已绑定的邮箱范围，不要询问、不要改绑、不要读取其他邮箱。\n" +
+  "2. 这是定时任务执行场景：直接完成摘要，不要输出寒暄、菜单、能力介绍。\n" +
+  "3. 如果没有邮件或没有需要关注的内容，按固定日报格式明确说明。"
 
 /**
  * 查操作者在飞书通讯录里登记的企业邮箱（tenant token + contact:user.email:readonly）。
@@ -69,13 +93,15 @@ export interface CronJobInfo {
 export interface CronController {
   describe(): string
   list(): CronJobInfo[]
+  find(name: string): (CronJobInfo & { bot: string; userId?: string }) | undefined
   /** Jobs this person may see and change: their own, plus legacy jobs that belong to this chat and have no owner. */
   listFor(openId: string, chatId: string): CronJobInfo[]
   add(args: string[], identity: ChatIdentity, botName: string): Promise<string>
-  remove(name: string): Promise<string>
+  remove(name: string, options?: { keepIntel?: boolean }): Promise<string>
   run(name: string): Promise<string>
   togglePause(name: string): boolean | undefined
   toggleUrgent(name: string): boolean | undefined
+  resumeMailJobsForOwner(openId: string): void
 }
 
 /**
@@ -86,6 +112,7 @@ export class CommandHandler {
   private formAnswer?: FormAnswerHandler
   private cron?: CronController
   private mailBinding?: MailBindingStore
+  private studio?: StudioService
 
   constructor(private readonly conversations: ConversationService) {}
 
@@ -99,6 +126,10 @@ export class CommandHandler {
 
   setMailBindingStore(store: MailBindingStore): void {
     this.mailBinding = store
+  }
+
+  setStudioService(service: StudioService | undefined): void {
+    this.studio = service
   }
 
   /** Returns true when the message was a command that has been handled. */
@@ -232,7 +263,15 @@ export class CommandHandler {
           await bot.sendText(identity.chatId, "用法:/make doc|ppt|word|pdf|excel|copy|poster", { replyTo: msg.messageId, mentions: mentionsFor(identity.chatType, identity.senderId, identity.senderName) })
           return true
         }
-        const data = this.conversations.makeFormData(identity.chatId, identity.senderId, format)
+        const deck = format === "pptx" ? makeDeckTask(rest[1]) : undefined
+        const data = this.conversations.makeFormData(
+          identity.chatId,
+          identity.senderId,
+          format,
+          undefined,
+          undefined,
+          deck,
+        )
         const preset = this.conversations.takeMakePreset(identity.chatId, identity.senderId)
         const nonce = this.conversations.issueMakeForm(identity.chatId, identity.senderId)
         await bot.sendCard(identity.chatId, makeFormCard(data, preset, nonce), { replyTo: msg.messageId, mentions: mentionsFor(identity.chatType, identity.senderId, identity.senderName) })

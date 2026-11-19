@@ -185,7 +185,15 @@ export class MailWatcher {
       `正文：${body || "(无正文)"}`,
     ].filter(Boolean).join("\n")
 
-    const reply = await this.deps.conversations.pregenerate(bot, target.chatId, prompt, undefined, target.ownerOpenId || undefined)
+    const { text: reply, paused } = await this.deps.conversations.pregenerate(
+      bot,
+      target.chatId,
+      prompt,
+      undefined,
+      target.ownerOpenId || undefined,
+      { agent: "pm-a64-mail" },
+    )
+    if (paused) return
     const match = /^\[MAIL-IMPORTANCE:(高|中|低)\]\s*(.*)$/m.exec(reply ?? "")
     const level = (match?.[1] ?? "中") as "高" | "中" | "低"
     const reason = (match?.[2] ?? "").trim()

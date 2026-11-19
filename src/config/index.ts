@@ -124,6 +124,11 @@ const MailWatchSchema = z.object({
    * from the bridge-owned binding file. 0 disables the proxy.
    */
   proxyPort: z.number().int().min(0).max(65535).default(4097),
+  /**
+   * Max concurrent OpenCode turns for scheduled mail digests (pregen + live).
+   * Per-subscriber work is still serialized; this only caps parallel users.
+   */
+  digestConcurrency: z.number().int().min(1).max(80).default(12),
 })
 
 const RetentionSchema = z.object({

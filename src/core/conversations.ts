@@ -26,6 +26,7 @@ import { ensureDir, ensureProjectLink, safeFileName, safeSegment } from "../util
 import { isWorkbookFile } from "./office.js"
 import { gapDoneCard, gapRetryCard, makeFormCard, markdownCard, nextFormNonce, welcomeCard, type MakeFormat, type MakeFormData, type MakeFormPreset } from "../feishu/cards.js"
 import { ensureInstructions, extractFileMarkers } from "./instructions.js"
+import { asksToModifyProductProfile, buildProductContextPrompt, detectProductContext, PRODUCT_PROFILE_MUTATION_DENIED } from "./product-context.js"
 import {
   emitOfficeFile,
   emitRequestedOffice,
@@ -43,6 +44,7 @@ export interface SessionContext {
   replyTo?: string
   chatType?: "p2p" | "group"
   userOpenId?: string
+  turnSource?: "user" | "command" | "cron"
 }
 
 interface TurnState {
@@ -174,6 +176,10 @@ function menuCommand(text: string): string {
   // 制作中心菜单（叶子节点发出的固定文本;「PPT 生成」与「生成 PPT」两种语序都认）。
   if (text === "文档制作" || text === "制作") return "/make doc"
   if (/^(?:PPT\s*(?:生成|制作)|生成\s*PPT)$/i.test(text)) return "/make ppt"
+  // 三个专项菜单共用同一张 PPT 制作卡,提交时按专项锁定成稿技能。
+  if (/^(?:制作)?商业计划书$|^产品(?:商业)?计划书$/.test(text)) return "/make ppt business-plan"
+  if (/^(?:制作)?产品(?:化|标准化)?请示$|^产品立项$/.test(text)) return "/make ppt product-request"
+  if (/^(?:制作)?产品退出(?:评审)?$|^退出评审$/.test(text)) return "/make ppt product-exit"
   if (/^(?:Word\s*(?:文档|生成|制作)|生成\s*Word|文档生成)$/i.test(text)) return "/make word"
   if (/^(?:PDF\s*(?:文档|生成|制作)|生成\s*PDF)$/i.test(text)) return "/make pdf"
   if (/^(?:Excel\s*(?:表格|生成|制作)?|生成\s*Excel|表格生成)$/i.test(text)) return "/make excel"
@@ -297,6 +303,17 @@ export class ConversationService {
   private readonly recovering = new Set<string>()
   private readonly following = new Set<string>()
   private readonly followedBody = new Map<string, string>()
+  private readonly makeFormCards = new Map<
+    string,
+    {
+      messageId: string
+      format: MakeFormat
+      chatType: "p2p" | "group"
+      preset?: MakeFormPreset
+      deck?: import("../feishu/cards.js").DeckTask
+    }
+  >()
+  private readonly makeErrorCards = new Map<string, Set<string>>()
 
   constructor(private readonly deps: ConversationDeps) {
     this.commands = new CommandHandler(this)
@@ -307,6 +324,14 @@ export class ConversationService {
   isSkillAdmin(openId?: string): boolean {
     if (!openId) return false
     return (this.deps.config.templateAdmins ?? []).includes(openId)
+  }
+
+  /**
+   * 产品介绍机器人（单产品知识维护）：只有它们才把「回复文件」当作输入继承下来，
+   * 并把附件预处理正文内联进提示。主 Agent 保持原有行为不变。
+   */
+  private isProductProfileBot(bot: FeishuBot): boolean {
+    return /^product-intro/.test(bot.config.agent) || /^product-intro/.test(bot.config.name)
   }
 
   /**
@@ -461,7 +486,7 @@ export class ConversationService {
         return
       }
       // 寒暄/启动词（无任务内容）：直接展示能力卡片，不进 agent。
-      if (text.length > 0 && msg.resources.length === 0 && isGreeting(text)) {
+      if (bot.name === "assistant" && text.length > 0 && msg.resources.length === 0 && isGreeting(text)) {
         const templates = this.listTemplates(msg.senderId)
         await bot.sendCard(msg.chatId, welcomeCard(templates.shared, templates.personal), {
           replyTo: msg.messageId,
@@ -472,6 +497,16 @@ export class ConversationService {
       }
       const binding = await this.ensureSession(bot, identity, msg.chatId)
       const held = binding.pendingAttachments ?? []
+      const repliedResources =
+        this.isProductProfileBot(bot) && msg.resources.length === 0 && msg.replyToMessageId
+          ? await bot.getMessageResources(msg.replyToMessageId).catch((error) => {
+              this.deps.logger.info("Reply target resources unavailable", {
+                replyToMessageId: msg.replyToMessageId,
+                error: error instanceof Error ? error.message : String(error),
+              })
+              return []
+            })
+          : []
 
       // Files are stored first and are not parsed here. Parsing starts later,
       // only when an instruction is sent, inside the prompt.
@@ -483,9 +518,10 @@ export class ConversationService {
           })
           .catch(() => {})
       }
-      const incoming = msg.resources.length > 0 ? await this.prepareAttachments(bot, msg, binding) : []
+      const attachmentMsg = repliedResources.length > 0 ? { ...msg, resources: repliedResources } : msg
+      const incoming = attachmentMsg.resources.length > 0 ? await this.prepareAttachments(bot, attachmentMsg, binding) : []
       if (incoming.length > 0) await this.refreshPendingMakeForm(bot, msg.chatId, msg.senderId)
-      if (msg.resources.length > 0 && incoming.length === 0) {
+      if (attachmentMsg.resources.length > 0 && incoming.length === 0) {
         await bot
           .sendMarkdown(msg.chatId, "这轮文件没有保存下来。请把文件重新发一次；文件和指令可以分两条消息发。", {
             replyTo: msg.messageId,
@@ -500,6 +536,9 @@ export class ConversationService {
         this.revokeMakeForm(msg.chatId, msg.senderId)
         let promptText = text
         let files = [...held, ...incoming]
+        if (repliedResources.length > 0 && incoming.length > 0) {
+          promptText = `${text}\n\n本轮未直接上传新文件；按你的回复关系，已继承被回复消息里的材料。`
+        }
         // This message brought files, or earlier file-only messages are still
         // waiting. Only when neither exists do we resolve a reference against
         // the chat's saved copies.
@@ -643,6 +682,7 @@ export class ConversationService {
     onDelivered?: (messageId?: string) => void,
     cardTitle?: string,
     userOpenId?: string,
+    _options?: { agent?: string },
   ): Promise<void> {
     const identity: ChatIdentity = {
       chatId,
@@ -665,7 +705,8 @@ export class ConversationService {
     prompt: string,
     userId?: string,
     userOpenId?: string,
-  ): Promise<string | undefined> {
+    _options?: { agent?: string },
+  ): Promise<{ text?: string; paused?: boolean }> {
     // Run on a throwaway session, never the chat's main session:
     // 1. the serial queue keys on binding.key, so a main-session pregen would
     //    block the user's own messages ("working" state);
@@ -738,7 +779,7 @@ export class ConversationService {
       // 既不膨胀 bindings.json，也让 recovery 再也扫不到它。
       this.deps.bindings.delete(binding.key)
     }
-    return result
+    return { text: result, paused: false }
   }
 
   // ---- session binding ----------------------------------------------------
@@ -950,13 +991,25 @@ export class ConversationService {
   }
 
   /** Everything a make-form card needs: cached files + both template pools. */
-  makeFormData(chatId: string, openId: string, format: MakeFormat): MakeFormData {
+  makeFormData(
+    _botOrChatId: FeishuBot | string,
+    chatIdOrOpenId: string,
+    openIdOrFormat: string | MakeFormat,
+    formatArg?: MakeFormat,
+    _chatType?: "p2p" | "group",
+    deck?: import("../feishu/cards.js").DeckTask,
+  ): MakeFormData {
+    const chatId = typeof _botOrChatId === "string" ? _botOrChatId : chatIdOrOpenId
+    const openId = typeof _botOrChatId === "string" ? chatIdOrOpenId : String(openIdOrFormat)
+    const format = typeof _botOrChatId === "string" ? (openIdOrFormat as MakeFormat) : formatArg!
     const lists = this.listTemplates(openId)
     return {
       format,
+      deck,
       files: this.listCachedFilesFor(chatId),
       sharedTemplates: lists.shared,
       personalTemplates: lists.personal,
+      uploadedTemplates: [],
     }
   }
 
@@ -1026,6 +1079,9 @@ export class ConversationService {
     messageId: string,
     format: MakeFormat,
     preset: MakeFormPreset,
+    _chatType?: "p2p" | "group",
+    _accept?: "material" | "template",
+    _deck?: import("../feishu/cards.js").DeckTask,
   ): void {
     const now = Date.now()
     this.pendingMakeUploads.set(`${chatId}:${openId}`, {
@@ -1076,8 +1132,12 @@ export class ConversationService {
       cloud: string
       /** PPT 场景 id；空则由指令文字自动判断。 */
       scenario?: string
+      deck?: import("../feishu/cards.js").DeckTask
     },
-  ): Promise<{ ok: true } | { ok: false; error: string }> {
+  ): Promise<
+    | { ok: true; fileCount: number; templateLabel: string; start: () => void }
+    | { ok: false; error: string }
+  > {
     const identity: ChatIdentity = {
       chatId: input.chatId,
       chatType: input.chatType,
@@ -1112,15 +1172,128 @@ export class ConversationService {
       scenario: scene?.label,
       operator: input.senderId,
     })
+    const start = () => {
+      void this.runTurn({
+        bot,
+        binding,
+        text,
+        files,
+        source: "user",
+        userOpenId: input.senderId,
+      })
+    }
+    return {
+      ok: true,
+      fileCount: files.length,
+      templateLabel: input.template || "",
+      start,
+    }
+  }
+
+  rememberMakeFormCard(
+    chatId: string,
+    openId: string,
+    messageId: string,
+    format: MakeFormat,
+    chatType: "p2p" | "group",
+    preset?: MakeFormPreset,
+    deck?: import("../feishu/cards.js").DeckTask,
+  ): void {
+    this.makeFormCards.set(`${chatId}:${openId}`, { messageId, format, chatType, preset, deck })
+  }
+
+  currentMakeFiles(chatId: string, openId: string): string[] {
+    return this.makeFormCards.get(`${chatId}:${openId}`)?.preset?.files ?? []
+  }
+
+  currentMakeTemplate(chatId: string, openId: string): string | undefined {
+    return this.makeFormCards.get(`${chatId}:${openId}`)?.preset?.template
+  }
+
+  async refreshMakeFormFiles(
+    bot: FeishuBot,
+    chatId: string,
+    openId: string,
+    chatType: "p2p" | "group",
+    format: MakeFormat,
+    preset: MakeFormPreset | undefined,
+    messageId: string,
+    _reason?: string,
+    deck?: import("../feishu/cards.js").DeckTask,
+  ): Promise<{ messageId: string; count: number; mode: "updated" | "republished"; labels: string[] }> {
+    const data = this.makeFormData(chatId, openId, format, undefined, chatType, deck)
+    const nonce = this.rollMakeFormNonce(chatId, openId)
+    this.rememberMakeFormCard(chatId, openId, messageId, format, chatType, preset, deck)
+    await bot.updateCard(messageId, makeFormCard(data, preset, nonce)).catch(() => {})
+    return {
+      messageId,
+      count: data.files.length,
+      mode: "updated",
+      labels: data.files.slice(0, 6).map((file) => file.label),
+    }
+  }
+
+  noteMakeFailure(chatId: string, openId: string, messageId: string): void {
+    const key = `${chatId}:${openId}`
+    const set = this.makeErrorCards.get(key) ?? new Set<string>()
+    set.add(messageId)
+    this.makeErrorCards.set(key, set)
+  }
+
+  markMakeErrorCard(messageId: string): void {
+    for (const set of this.makeErrorCards.values()) set.add(messageId)
+  }
+
+  clearMakeErrorCard(messageId: string): void {
+    for (const [key, set] of this.makeErrorCards) {
+      set.delete(messageId)
+      if (set.size === 0) this.makeErrorCards.delete(key)
+    }
+  }
+
+  dismissMakeFailures(
+    _bot: FeishuBot,
+    chatId: string,
+    openId: string,
+    messageId?: string,
+  ): Promise<void> {
+    const key = `${chatId}:${openId}`
+    const set = this.makeErrorCards.get(key)
+    if (set && messageId) set.delete(messageId)
+    if (set && set.size === 0) this.makeErrorCards.delete(key)
+    return Promise.resolve()
+  }
+
+  async runInChat(
+    bot: FeishuBot,
+    chatId: string,
+    prompt: string,
+    options?: {
+      userId?: string
+      replyTo?: string
+      onDelivered?: (messageId?: string) => void
+      cardTitle?: string
+      userOpenId?: string
+      agent?: string
+    },
+  ): Promise<void> {
+    const identity: ChatIdentity = {
+      chatId,
+      chatType: options?.userId ? "group" : "p2p",
+      senderId: options?.userId ?? "cron",
+      senderName: "cron",
+    }
+    const binding = await this.ensureSession(bot, identity, chatId)
     await this.runTurn({
       bot,
       binding,
-      text,
-      files,
-      source: "user",
-      userOpenId: input.senderId,
+      replyTo: options?.replyTo,
+      text: prompt,
+      source: "cron",
+      onDelivered: options?.onDelivered,
+      cardTitle: options?.cardTitle,
+      userOpenId: options?.userOpenId,
     })
-    return { ok: true }
   }
 
   /**
@@ -1303,6 +1476,22 @@ export class ConversationService {
 
   async runTurn(request: TurnRequest): Promise<boolean> {
     const { bot, binding } = request
+    if (asksToModifyProductProfile(bot.name, request.text)) {
+      this.deps.audit.record("product_profile.change.denied", {
+        bot: bot.name,
+        chatId: binding.chatId,
+        userId: request.userOpenId ?? binding.userId,
+      })
+      if (!request.silent) {
+        await bot
+          .sendMarkdown(binding.chatId, PRODUCT_PROFILE_MUTATION_DENIED, {
+            replyTo: request.replyTo,
+            mentions: request.source === "user" ? mentionsFor(binding.chatType, request.userOpenId ?? binding.userId) : undefined,
+          })
+          .catch(() => {})
+      }
+      return false
+    }
     if (binding.chatType === "group" && request.source !== "cron" && asksToChangeLocalConfig(request.text)) {
       this.deps.audit.record("config.change.denied", {
         bot: bot.name,
@@ -1327,8 +1516,10 @@ export class ConversationService {
         : request.source === "user" && request.userOpenId
           ? this.skills.match(request.text, request.userOpenId).map((hit) => hit.skill)
           : []
-      const skillPrompt =
+      const productContext = detectProductContext(bot.name, request.text)
+      const basePrompt =
         applied.length > 0 ? `${request.text}\n\n---\n${applied.map(renderSkillBlock).join("\n\n")}` : request.text
+      const skillPrompt = productContext ? buildProductContextPrompt(basePrompt, productContext) : basePrompt
       const client = await this.deps.opencode.client()
       const accumulator = new TurnAccumulator(bot.config.streaming.showTools, bot.config.streaming.showReasoning)
       if (!request.silent && request.cardTitle) accumulator.titlePrefix = request.cardTitle
@@ -1406,6 +1597,7 @@ export class ConversationService {
         replyTo: request.replyTo,
         chatType: binding.chatType,
         userOpenId: request.userOpenId ?? binding.userId,
+        turnSource: request.source,
       }
       this.contexts.set(binding.sessionID, context)
 
@@ -1445,7 +1637,7 @@ export class ConversationService {
         await client.prompt(binding.sessionID, {
           text: skillPrompt,
           files: promptFiles,
-        })
+        }, { inlineDocuments: this.isProductProfileBot(bot) })
         accepted = true
         // The watchdog has been ticking since before this call. Session-create
         // events set sawEvent, and four "not busy" observations would otherwise
@@ -1465,6 +1657,7 @@ export class ConversationService {
           text: request.text.slice(0, 500),
           attachments: promptFiles.length,
           skills: applied.map((skill) => skill.name),
+          product: productContext?.profile.name,
         })
         for (const skill of applied) {
           this.skills.markUsed(skill)
